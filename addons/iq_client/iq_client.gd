@@ -423,6 +423,153 @@ func _with_signature(result: Variant) -> Variant:
 #endregion
 
 
+#region Identity and encryption
+
+## Which wallets the host is paying with, and what they hold.
+##
+## Returns {sol: {address, balance, unit, rpc}, mon: {...}}, with only the
+## chains the host has a key for. A chain that could not be reached carries an
+## "error" instead of a balance. Costs nothing and never prompts.
+##
+## Worth checking before a run of writes: an unfunded account and a genuine bug
+## both surface as "transaction simulation failed", and this tells them apart.
+func wallet_info() -> Dictionary:
+	var response: Dictionary = await _request("GET", "/wallet")
+	if not response.get("ok", false):
+		return {}
+	var data: Variant = response.get("data")
+	return data if data is Dictionary else {}
+
+
+## What one chain's wallet holds, or -1.0 if that is not knowable.
+func balance_of(chain: String) -> float:
+	var info: Dictionary = await wallet_info()
+	var entry: Variant = info.get(_normalize_chain(chain), {})
+	if not entry is Dictionary or (entry as Dictionary).has("error"):
+		return -1.0
+	return float((entry as Dictionary).get("balance", -1.0))
+
+
+## This wallet's public encryption identity, as hex.
+##
+## Derived deterministically from the host's signing key, so it is the same
+## every time and needs nothing stored. Publish it and others can encrypt
+## things only this wallet can open. Returns "" on failure.
+func crypto_identity() -> String:
+	var response: Dictionary = await _request("GET", "/crypto/identity")
+	if not response.get("ok", false):
+		return ""
+	var data: Variant = response.get("data")
+	if data is Dictionary:
+		return str((data as Dictionary).get("publicKey", ""))
+	return ""
+
+
+## Encrypts `text` so that any one of `recipients` can open it, and nobody else.
+##
+## Recipients are identity keys as returned by crypto_identity(). Costs nothing
+## and needs no secret of ours, so it never prompts. Returns the envelope to
+## store or inscribe, or {} on failure.
+func encrypt_to(recipients: PackedStringArray, text: String) -> Dictionary:
+	if recipients.is_empty():
+		last_error = "No recipients given."
+		return {}
+	if text.is_empty():
+		last_error = "Nothing to encrypt."
+		return {}
+
+	var response: Dictionary = await _request(
+		"POST", "/crypto/encryptTo", {}, {"recipients": recipients, "data": text}
+	)
+	if not response.get("ok", false):
+		return {}
+	var data: Variant = response.get("data")
+	return data if data is Dictionary else {}
+
+
+## Opens an envelope addressed to this wallet.
+##
+## This uses the user's own identity key, so unless the app has already been
+## granted it the call blocks while GodOnChain asks — exactly like a write —
+## and returns "" if refused. Failing because the envelope is addressed to
+## somebody else is an ordinary outcome, not an error.
+func decrypt_envelope(envelope: Dictionary) -> String:
+	if envelope.is_empty() or not envelope.has("recipients"):
+		last_error = "That is not an envelope."
+		return ""
+
+	var response: Dictionary = await _request(
+		"POST", "/crypto/decrypt", {}, {"envelope": envelope}
+	)
+	if not response.get("ok", false):
+		return ""
+	var data: Variant = response.get("data")
+	if data is Dictionary:
+		return str((data as Dictionary).get("data", ""))
+	return ""
+
+#endregion
+
+
+#region Time locks
+
+## How many sequential squarings this machine manages per second.
+##
+## Only meaningful as calibration: a faster machine solves the same puzzle
+## sooner, so a duration built from this is a floor, never a deadline.
+func timelock_rate() -> int:
+	var response: Dictionary = await _request("GET", "/timelock/rate")
+	if not response.get("ok", false):
+		return 0
+	var data: Variant = response.get("data")
+	if data is Dictionary:
+		return int((data as Dictionary).get("squaringsPerSecond", 0))
+	return 0
+
+
+## Seals `secret_hex` behind roughly `seconds` of sequential work.
+##
+## Instant, because whoever builds a puzzle holds the shortcut. The shortcut is
+## destroyed before this returns; only the climb remains. Returns {} on failure.
+func timelock_create(secret_hex: String, seconds: int) -> Dictionary:
+	if secret_hex.is_empty():
+		last_error = "Nothing to lock."
+		return {}
+	if seconds <= 0:
+		last_error = "A time lock needs a positive duration."
+		return {}
+
+	var response: Dictionary = await _request(
+		"POST", "/timelock/create", {}, {"secret": secret_hex, "seconds": seconds}
+	)
+	if not response.get("ok", false):
+		return {}
+	var data: Variant = response.get("data")
+	return data if data is Dictionary else {}
+
+
+## Does the work. There is no shortcut, so this takes as long as it takes —
+## `progress_callback` receives 0-100 and is the only thing worth showing.
+##
+## Returns the secret as hex, or "" if it failed or the puzzle was tampered with.
+func timelock_solve(puzzle: Dictionary, progress_callback: Callable = Callable()) -> String:
+	if puzzle.is_empty() or not puzzle.has("n"):
+		last_error = "That is not a time-lock puzzle."
+		return ""
+
+	var started: Dictionary = await _request(
+		"POST", "/timelock/solve", {}, {"puzzle": puzzle}
+	)
+	var result: Variant = await _follow_job(started, progress_callback)
+	if result == null:
+		return ""
+	if result is Dictionary:
+		return str((result as Dictionary).get("secret", ""))
+	return ""
+
+#endregion
+
+
 #region Job polling
 
 ## Takes a {jobId} response and polls it to completion.
@@ -530,16 +677,35 @@ func _request(
 		host_missing.emit(last_error)
 		return {"ok": false, "code": code, "error": last_error, "text": text}
 
-	var parsed: Variant = JSON.parse_string(text)
+	# Not every response is JSON, so only parse what looks like it. The HanLock
+	# routes answer in plain text by design, and an unknown route answers with
+	# an HTML error page — feeding either to the parser produced an engine-level
+	# error with no useful message attached.
+	var trimmed := text.strip_edges()
+	var parsed: Variant = null
+	if trimmed.begins_with("{") or trimmed.begins_with("["):
+		parsed = JSON.parse_string(trimmed)
 
 	if code < 200 or code >= 300:
-		var message := text
+		var message := trimmed
 		if parsed is Dictionary and (parsed as Dictionary).has("error"):
 			message = str((parsed as Dictionary)["error"])
+
 		if code == 401:
 			message = "This app is not authorised to use the on-chain host."
 		elif code == 403 and message.is_empty():
 			message = "The user declined this request."
+		elif code == 404:
+			# Almost always a version skew rather than a genuine missing thing:
+			# the host predates the call this app is making.
+			message = (
+				"The host does not offer %s. It is probably older than this app "
+				% path
+				+ "— rebuild the sidecar with: cd sidecar && node build.mjs"
+			)
+		elif message.is_empty():
+			message = "The host answered %d with nothing to say." % code
+
 		last_error = message
 		return {"ok": false, "code": code, "error": message, "data": parsed, "text": text}
 

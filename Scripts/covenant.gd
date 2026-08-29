@@ -74,7 +74,7 @@ func unseal(tablet: Dictionary, key: PackedByteArray) -> String:
 		last_error = "That key is the wrong size — the fragments may not match."
 		return ""
 
-	var iv := _hex_to_bytes(str(tablet.get("iv", "")))
+	var iv := hex_to_bytes(str(tablet.get("iv", "")))
 	if iv.size() != IV_BYTES:
 		last_error = "The tablet is missing its initialisation vector."
 		return ""
@@ -212,7 +212,7 @@ static func _unpad(data: PackedByteArray) -> PackedByteArray:
 	return data.slice(0, data.size() - padding)
 
 
-static func _hex_to_bytes(text: String) -> PackedByteArray:
+static func hex_to_bytes(text: String) -> PackedByteArray:
 	var cleaned := text.strip_edges().to_lower()
 	if cleaned.is_empty() or cleaned.length() % 2 != 0:
 		return PackedByteArray()

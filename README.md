@@ -47,15 +47,34 @@ Tending it costs roughly a dollar and takes one approval. Three states:
 | `GUTTERING` | Past the interval, inside grace. Tend it. |
 | `DARK` | Past grace. The covenant may be opened. |
 
+Each tablet keeps its own flame, so one going dark says nothing about the
+others. A keeper may hold many at once; dark ones are listed first, because
+that is the only row anyone opens this app to see.
+
 **The covenant** is encrypted the moment you seal it and inscribed as
 ciphertext, so it's public and permanent from day one. Nothing about it is
 secret because it's hidden — it's secret because the key is split.
 
 **The fragments** come from Shamir's scheme over GF(256). Any *k* of *n*
 restore the key; fewer reveal *nothing*, and that's information-theoretic, not
-a matter of computing power. The key never leaves the app and the fragments are
-shown exactly once. Nothing writes them down: putting every fragment in one
-file would undo the entire point.
+a matter of computing power.
+
+**Fragments travel on-chain.** Give a witness their identity key and their
+fragment is encrypted to it and inscribed alongside the tablet — nothing to
+hand over, nothing for them to lose, no email to survive. A witness's identity
+is derived from their wallet, so it is the same on every machine they sign with
+and there is nothing to store. Leave the key blank and you deliver that one by
+hand instead; those are shown exactly once and never written down.
+
+**Witnesses testify in public.** A witness holding one fragment cannot open
+anything alone, and privately coordinating *k* people is the organisational
+fragility this exists to avoid. So once a flame is dark they publish their
+fragment instead. When enough have, anyone can reconstruct the key and the word
+is out. Testifying *is* the release, not a step towards privately reading it —
+the app says so before you do it.
+
+**Release modes combine.** A tablet may use witnesses, a public burn, or both,
+in which case whichever happens first opens it.
 
 ## Requirements
 
@@ -71,10 +90,15 @@ capability, not a requirement.
 1. Open `project.godot` in Godot 4.7+ and press **F5**.
 2. **SETTINGS** — name a covenant root (the `dbRootId` your flame lives under),
    pick a chain, and set the interval and grace period.
-3. **BUILD THE ALTAR** — creates the flame table. Once per keeper.
-4. **TEND THE FLAME** — writes a proof-of-life row. Do this on schedule.
-5. **SEAL A COVENANT** — write the word, choose how many witnesses and how many
-   are needed, and hand out the fragments.
+3. **NEW COVENANT** — write the word or choose a file, name your witnesses,
+   and say how many fragments are needed to open it.
+4. **BUILD ALTAR** — creates that tablet's flame table, and the place its
+   witnesses will testify. Once per tablet.
+5. **TEND** — writes a proof-of-life row. Do this on schedule.
+
+As a witness: **MY IDENTITY** gives you the key to hand a keeper. **ADOPT**
+takes a tablet by its signature. **TESTIFY** opens the fragment addressed to
+you and publishes it.
 
 Grace is generous by default (30 + 60 days) because **being unreachable is not
 being dead**, and a false release cannot be undone.
@@ -86,6 +110,10 @@ Scripts/
   shamir.gd        Secret sharing over GF(256)
   covenant.gd      Seal, shatter, gather, unseal
   flame.gd         The heartbeat and its three states
+  tablet.gd        One switch: payload, terms, release modes
+  ark.gd           Every switch this keeper holds
+  testimony.gd     Where witnesses publish their fragments
+  chain_table.gd   Reading a table on either chain
   scripture.gd     Everything the app says out loud
   temple_theme.gd  Sixteen colours on black
 Scenes/
@@ -101,6 +129,17 @@ tools/
 ```bash
 Godot --headless --path . --script res://tools/bbp_selftest.gd
 ```
+
+There is also a live check of the part that crosses a process boundary:
+
+```bash
+Godot --headless --path . --script res://tools/bbp_witness_check.gd
+```
+
+It needs a running GodOnChain host and the `GODONCHAIN_IQ_*` variables set. It
+derives a wallet identity, wraps a fragment to it, opens it again, confirms the
+recovered fragment still reconstructs the key with a peer, and confirms an
+envelope addressed to somebody else stays shut.
 
 Shamir gets the most attention, because a splitting bug that still round-trips
 on the happy path would silently produce a covenant nobody can ever open — and
@@ -121,6 +160,12 @@ gather → unseal path.
   indefinitely. It's the sharpest attack on this design.
 - **Witnesses can collude early.** A threshold raises the bar; it doesn't
   remove it. Choose people who don't share a dinner table.
+- **A public burn is not a lock.** Its key rides in the tablet, so anyone
+  reading the chain can open it the day it is sealed. The app just doesn't
+  offer to until the flame is dark. Use it only for what you mean to become
+  public anyway.
+- **Testimony is irreversible.** Once enough witnesses publish, the covenant is
+  open to everyone, forever.
 - **A block time is evidence, not adjudication.** It proves bytes existed by a
   moment. It doesn't execute your will.
 

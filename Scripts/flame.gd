@@ -23,7 +23,6 @@ enum State {
 	DARK,
 }
 
-const TABLE_NAME := "flame"
 const COLUMNS := ["id", "ts", "note"]
 const ID_COLUMN := "id"
 
@@ -38,10 +37,11 @@ var interval_days: int = 30
 ## How long after that before the flame is declared dark.
 var grace_days: int = 60
 
-var last_error: String = ""
+## Each tablet keeps its own flame, so one going dark says nothing about the
+## others. Set by Ark from the tablet it belongs to.
+var table_name: String = "flame"
 
-## tablePda for Solana, resolved once and reused.
-var _table_pda: String = ""
+var last_error: String = ""
 
 
 func _init(iq: IQClient = null, root: String = "", target_chain: String = "sol") -> void:
@@ -55,6 +55,16 @@ func days_until_dark() -> int:
 	return interval_days + grace_days
 
 
+## Whether a covenant on this flame may actually be released yet.
+##
+## This is what the grace period is for. Between the interval and the deadline
+## the keeper is visibly overdue — nagged, and marked overdue to their
+## witnesses — but nothing irreversible may happen, because being late is not
+## the same as being gone. Only past the deadline does release arm.
+static func releasable(state: State) -> bool:
+	return state == State.DARK
+
+
 #region Writing
 
 ## Creates the flame table. Only needed once per keeper, and it spends.
@@ -63,11 +73,33 @@ func kindle(progress: Callable = Callable()) -> Variant:
 	if not _ready():
 		return null
 	var result = await client.create_table(
-		db_root_id, TABLE_NAME, PackedStringArray(COLUMNS), ID_COLUMN, chain, {}, progress
+		db_root_id, table_name, PackedStringArray(COLUMNS), ID_COLUMN, chain, {}, progress
 	)
 	if result == null:
 		last_error = client.last_error
+	else:
+		ChainTable.forget(db_root_id, table_name, chain)
 	return result
+
+
+## Whether this flame's table can actually be found on-chain.
+##
+## A write job reporting "completed" only means the host finished its work, not
+## that the chain now holds what was asked for — a reverted transaction looks
+## the same from here. Anything that claims to have created something should
+## check afterwards rather than take its own word for it.
+func exists_on_chain() -> bool:
+	if client == null or not client.is_available():
+		return false
+	ChainTable.forget(db_root_id, table_name, chain)
+	var problem: Array = []
+	var rows: Dictionary = await ChainTable.read_rows(
+		client, db_root_id, table_name, chain, 1, problem
+	)
+	if not rows.is_empty():
+		return true
+	last_error = str(problem[0]) if not problem.is_empty() else "The table is not there."
+	return false
 
 
 ## Writes one proof-of-life row. This spends, so the keeper is prompted.
@@ -81,7 +113,7 @@ func tend(note: String = "", progress: Callable = Callable()) -> Variant:
 		"note": note.strip_edges(),
 	}
 
-	var result = await client.write_row(db_root_id, TABLE_NAME, row, chain, {}, progress)
+	var result = await client.write_row(db_root_id, table_name, row, chain, {}, progress)
 	if result == null:
 		last_error = client.last_error
 	return result
@@ -107,28 +139,23 @@ func read_status(limit: int = 20, progress: Callable = Callable()) -> Dictionary
 	if not _ready():
 		return unknown
 
-	var rows: Dictionary = {}
-	if _normalized_chain() == "mon":
-		rows = await client.read_db_table_rows(
-			"", db_root_id, TABLE_NAME, chain, limit, "", progress
-		)
-	else:
-		if _table_pda.is_empty() and not await _resolve_table_pda():
-			# No table yet is a real answer, not a failure.
-			if last_error.contains("not found") or last_error.is_empty():
-				var never := unknown.duplicate()
-				never["state"] = State.NEVER_LIT
-				return never
-			return unknown
-		rows = await client.read_db_table_rows(
-			_table_pda, "", "", chain, limit, "", progress
-		)
+	var problem: Array = []
+	var rows: Dictionary = await ChainTable.read_rows(
+		client, db_root_id, table_name, chain, limit, problem, progress
+	)
 
 	if rows.is_empty():
-		last_error = client.last_error
-		return unknown
+		last_error = str(problem[0]) if not problem.is_empty() else "Could not read the flame."
+		# We reached the host and it had nothing for us, which in practice means
+		# the table has not been created — the flame was never lit. UNKNOWN is
+		# reserved for not being able to ask at all, which _ready() has already
+		# caught above. Matching on error text was chain-specific and left MON
+		# covenants reading as UNKNOWN forever.
+		var never := unknown.duplicate()
+		never["state"] = State.NEVER_LIT
+		return never
 
-	var entries: Array = rows.get("rows", [])
+	var entries: Array = ChainTable.rows_of(rows)
 	if entries.is_empty():
 		var never := unknown.duplicate()
 		never["state"] = State.NEVER_LIT
@@ -137,9 +164,11 @@ func read_status(limit: int = 20, progress: Callable = Callable()) -> Dictionary
 
 	var newest := 0
 	for entry: Variant in entries:
-		if entry is Dictionary:
-			var ts := int(str((entry as Dictionary).get("ts", "0")))
-			newest = maxi(newest, ts)
+		var row: Dictionary = entry
+		# The timestamp is written as a string; on some paths it arrives as a
+		# number, so go through str() either way.
+		var ts := int(str(row.get("ts", "0")).split(".")[0])
+		newest = maxi(newest, ts)
 
 	if newest <= 0:
 		var never2 := unknown.duplicate()
@@ -166,37 +195,7 @@ func read_status(limit: int = 20, progress: Callable = Callable()) -> Dictionary
 	}
 
 
-## Solana addresses a table by PDA, which the row reader needs. The table list
-## is the only place to get it, so it is looked up once and cached.
-func _resolve_table_pda() -> bool:
-	var listing: Dictionary = await client.get_db_table_list(db_root_id, chain)
-	if listing.is_empty():
-		last_error = client.last_error
-		return false
-
-	var seeds: Array = listing.get("tableSeeds", [])
-	var pdas: Array = listing.get("tablePdas", [])
-	var wanted := TABLE_NAME.to_utf8_buffer().hex_encode()
-
-	for i in mini(seeds.size(), pdas.size()):
-		var seed := str(seeds[i]).to_lower()
-		if seed == wanted or seed == TABLE_NAME:
-			_table_pda = str(pdas[i])
-			return true
-
-	last_error = "No '%s' table under %s yet." % [TABLE_NAME, db_root_id]
-	return false
-
 #endregion
-
-
-func _normalized_chain() -> String:
-	var c := chain.strip_edges().to_lower()
-	return "mon" if (c == "mon" or c == "monad") else "sol"
-
-
-func _ready_check() -> bool:
-	return _ready()
 
 
 func _ready() -> bool:

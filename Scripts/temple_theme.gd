@@ -14,17 +14,23 @@ extends RefCounted
 const BLACK := Color("000000")
 const DARK_GREY := Color("555555")
 const GREY := Color("AAAAAA")
+## For disabled controls. Dark grey reads as unavailable but at 2.8:1 is also
+## unreadable, and a control you cannot read is one you cannot reason about.
+const MUTED := Color("808080")
 const WHITE := Color("FFFFFF")
 const RED := Color("AA0000")
 const BRIGHT_RED := Color("FF5555")
 const BROWN := Color("AA5500")
 const YELLOW := Color("FFFF55")
+## Warnings need to be read, and #AA5500 on black is 4:1 — under the threshold
+## for body text. This is the same hue carried up to a legible brightness.
+const AMBER := Color("FFAA55")
 const CYAN := Color("55FFFF")
 
 const FONT_PATH := "res://Assets/IBMPlexMono-Light.ttf"
 
 const SIZE_BODY := 16
-const SIZE_SMALL := 13
+const SIZE_SMALL := 14
 const SIZE_TITLE := 30
 
 
@@ -48,6 +54,8 @@ static func build() -> Theme:
 
 
 static func _style_labels(theme: Theme) -> void:
+	# Default text is the light grey, not the dark one. Dark grey is reserved
+	# for genuinely decorative things like dead wood in the bush.
 	theme.set_color("font_color", "Label", GREY)
 	theme.set_color("default_color", "RichTextLabel", GREY)
 	# The console is the only place long text lands, so give it room to breathe.
@@ -69,9 +77,23 @@ static func _style_buttons(theme: Theme) -> void:
 	theme.set_color("font_focus_color", "Button", YELLOW)
 	theme.set_color("font_disabled_color", "Button", DARK_GREY)
 
-	theme.set_stylebox("normal", "CheckBox", _outline(Color(0, 0, 0, 0), Color(0, 0, 0, 0)))
+	# CheckBox derives from Button, and Godot's theme lookup falls back to the
+	# base type — so every state has to be stated here or a checkbox picks up
+	# the button's solid yellow fill and renders its label invisibly on top.
+	var quiet := _outline(Color(0, 0, 0, 0), Color(0, 0, 0, 0))
+	theme.set_stylebox("normal", "CheckBox", quiet)
+	theme.set_stylebox("hover", "CheckBox", _outline(Color(0, 0, 0, 0), Color("141414")))
+	theme.set_stylebox("pressed", "CheckBox", _outline(Color(0, 0, 0, 0), Color("141414")))
+	theme.set_stylebox("hover_pressed", "CheckBox", _outline(Color(0, 0, 0, 0), Color("141414")))
+	theme.set_stylebox("focus", "CheckBox", _outline(DARK_GREY, Color(0, 0, 0, 0)))
+	theme.set_stylebox("disabled", "CheckBox", quiet)
+
 	theme.set_color("font_color", "CheckBox", GREY)
-	theme.set_color("font_hover_color", "CheckBox", WHITE)
+	theme.set_color("font_hover_color", "CheckBox", YELLOW)
+	theme.set_color("font_pressed_color", "CheckBox", YELLOW)
+	theme.set_color("font_hover_pressed_color", "CheckBox", YELLOW)
+	theme.set_color("font_focus_color", "CheckBox", WHITE)
+	theme.set_color("font_disabled_color", "CheckBox", MUTED)
 
 
 static func _style_inputs(theme: Theme) -> void:
@@ -139,6 +161,17 @@ static func line(text: String, colour: Color = GREY, size: int = SIZE_BODY) -> L
 	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	return label
+
+
+## The one action the app is recommending: filled rather than outlined, so
+## there is never a question of where to look first.
+static func primary_button(text: String, on_pressed: Callable) -> Button:
+	var b := button(text, on_pressed)
+	b.add_theme_stylebox_override("normal", _solid(YELLOW))
+	b.add_theme_stylebox_override("hover", _solid(WHITE))
+	b.add_theme_color_override("font_color", BLACK)
+	b.add_theme_color_override("font_hover_color", BLACK)
+	return b
 
 
 static func button(text: String, on_pressed: Callable) -> Button:
