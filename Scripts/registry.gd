@@ -1,125 +1,109 @@
-## Registries: how a sealed covenant becomes findable.
+## The registry: how a sealed covenant becomes findable.
 ##
 ## Without one, a witness has to be handed an 88-character signature by some
 ## channel that must still exist years later — the exact fragility this project
-## exists to avoid. A root is short, memorable, and can be written in a will, a
-## profile, or on paper.
+## exists to avoid. A keeper's handle is short, memorable, and can be written
+## in a will, a profile, or on paper.
 ##
-## Two registries, same shape:
+## One table, under the protocol's own root, holding every covenant anyone has
+## chosen to list. It used to be two — a private one under each keeper's own
+## root and a shared commons — but under a single app root those are the same
+## table, so the distinction moved from *where* a listing lives to *what it
+## says*: every row carries the handle of the keeper who wrote it.
 ##
-##   A keeper's own, under their root. Anyone who knows the root sees
-##   everything that keeper has sealed. This is the private-ish default.
-##
-##   The commons, under a root everyone shares. Opting in makes a covenant
-##   browsable by strangers, which is the point when the thing is meant to
-##   reach the public, and the wrong choice when it is not.
+##   for_handle()  what one keeper has listed. This is how a witness finds
+##                 what they were named in, knowing only the handle.
+##   list()        everything anyone has listed. The commons.
 ##
 ## Listing never makes anything readable. The tablets were public and permanent
-## the moment they were inscribed; a registry only makes them findable.
+## the moment they were inscribed; a registry only makes them findable. And it
+## is genuinely public either way: writing a row here is opting in to being
+## browsed by strangers, whichever call reads it back.
 
 class_name Registry
 extends RefCounted
 
-## The shared root. Anything listed here is browsable by anyone, forever.
-const COMMONS_ROOT := "burning-bush-commons"
-
 const TABLE_NAME := "covenants"
 ## Carries enough to draw a browse row without fetching every tablet: only the
 ## flame state needs a further read, and that is free.
+##
+## `handle` is what makes one table serve as everyone's registry: it is the
+## keeper's chosen name for their records, and the only thing distinguishing
+## one keeper's listings from another's now that the root is shared.
 const COLUMNS := [
-	"id", "signature", "title", "keeper", "root", "chain", "sealed_at", "dark_after"
+	"id", "signature", "title", "keeper", "handle", "chain", "sealed_at", "dark_after"
 ]
 const ID_COLUMN := "id"
 
-var client: IQClient
-var db_root_id: String = ""
+## One space for the protocol's root. The chain travels with each call, since
+## a covenant chooses its own and one keeper may hold covenants on both.
+var space: IQSpace
 var chain: String = "sol"
 var last_error: String = ""
 
 
-func _init(iq: IQClient = null, root: String = "", target_chain: String = "sol") -> void:
-	client = iq
-	db_root_id = root
+func _init(iq: IQClient = null, target_chain: String = "sol") -> void:
 	chain = target_chain
+	space = IQSpace.new(iq, Tablet.APP_ROOT, target_chain)
 
 
-## The shared registry everyone can browse.
-static func commons(iq: IQClient, target_chain: String = "sol") -> Registry:
-	return Registry.new(iq, COMMONS_ROOT, target_chain)
-
-
-func is_commons() -> bool:
-	return db_root_id == COMMONS_ROOT
-
-
-## Creates the registry. Once per root — and for the commons, once ever, by
-## whoever gets there first.
+## Creates the registry table. Once ever per chain, by whoever gets there first.
+##
+## Deliberately no writer whitelist: every keeper has to be able to list their
+## own covenant. A row here is a public claim about a covenant that is already
+## public, so a forged one is a nuisance rather than a danger — unlike a flame
+## row, which is a claim about whether someone is alive.
 func prepare(progress: Callable = Callable()) -> Variant:
-	if not _ready():
-		return null
-	var result = await client.create_table(
-		db_root_id, TABLE_NAME, PackedStringArray(COLUMNS), ID_COLUMN, chain, {}, progress
+	var here := space.on(chain)
+	var result = await here.create_table(
+		TABLE_NAME, PackedStringArray(COLUMNS), ID_COLUMN, PackedStringArray(), progress
 	)
 	if result == null:
-		last_error = client.last_error
-	else:
-		ChainTable.forget(db_root_id, TABLE_NAME, chain)
+		last_error = here.last_error
 	return result
 
 
 ## Lists one covenant so it can be found later.
-func publish(tablet: Tablet, progress: Callable = Callable()) -> Variant:
-	if not _ready():
-		return null
-
+func publish(
+	tablet: Tablet, handle: String = "", progress: Callable = Callable()
+) -> Variant:
 	var row := {
 		"id": tablet.id,
 		"signature": tablet.signature,
 		"title": tablet.title,
 		"keeper": tablet.keeper,
-		"root": tablet.db_root_id,
+		"handle": handle.strip_edges(),
 		"chain": tablet.chain,
 		"sealed_at": str(tablet.sealed_at),
 		# So a browser can show the deadline without reading the tablet itself.
 		"dark_after": str(tablet.days_until_dark()),
 	}
 
-	var result = await client.write_row(db_root_id, TABLE_NAME, row, chain, {}, progress)
+	var here := space.on(chain)
+	var result = await here.write_row(TABLE_NAME, row, progress)
 	if result == null:
-		last_error = client.last_error
+		last_error = here.last_error
 	return result
 
 
-## Everything listed here, newest first. Costs nothing.
+## Everything listed, newest first. Costs nothing.
 ##
-## Entries are {id, signature, title, keeper, root, chain, sealed_at,
+## Entries are {id, signature, title, keeper, handle, chain, sealed_at,
 ## dark_after}. An empty result means no registry or nothing listed, which look
 ## the same to a reader and are treated the same.
 func list(limit: int = 100, progress: Callable = Callable()) -> Array:
-	if client == null or not client.is_available():
-		last_error = "Not attached to a host."
-		return []
-	if db_root_id.strip_edges().is_empty():
-		last_error = "No root given."
-		return []
-
 	var problem: Array = []
-	var rows: Dictionary = await ChainTable.read_rows(
-		client, db_root_id, TABLE_NAME, chain, limit, problem, progress
-	)
+	var rows: Array = await space.on(chain).read_rows(TABLE_NAME, limit, problem, progress)
 	if rows.is_empty():
-		if is_commons():
-			last_error = "Nothing has been listed publicly yet."
-		else:
-			last_error = (
-				str(problem[0]) if not problem.is_empty()
-				else "Nothing is listed under '%s'." % db_root_id
-			)
+		last_error = (
+			str(problem[0]) if not problem.is_empty()
+			else "Nothing has been listed yet."
+		)
 		return []
 
 	var entries: Array = []
 	var seen := {}
-	for row: Variant in ChainTable.rows_of(rows):
+	for row: Variant in rows:
 		var record: Dictionary = row
 		var signature := str(record.get("signature", "")).strip_edges()
 		# The same covenant listed twice is one covenant.
@@ -131,7 +115,7 @@ func list(limit: int = 100, progress: Callable = Callable()) -> Array:
 			"signature": signature,
 			"title": str(record.get("title", "untitled")),
 			"keeper": str(record.get("keeper", "")),
-			"root": str(record.get("root", db_root_id)),
+			"handle": str(record.get("handle", "")),
 			"chain": str(record.get("chain", chain)),
 			"sealed_at": int(str(record.get("sealed_at", "0"))),
 			"dark_after": int(str(record.get("dark_after", "90"))),
@@ -141,15 +125,30 @@ func list(limit: int = 100, progress: Callable = Callable()) -> Array:
 	return entries
 
 
+## What one keeper has listed, by their handle.
+##
+## Filtered here rather than on-chain: the table has no index, so every reader
+## fetches rows and picks. Fine while a registry is small, and the alternative
+## — a table per keeper — is what made the fee go to each keeper instead of the
+## protocol.
+func for_handle(
+	handle: String, limit: int = 100, progress: Callable = Callable()
+) -> Array:
+	var wanted := handle.strip_edges().to_lower()
+	if wanted.is_empty():
+		last_error = "No handle given."
+		return []
+
+	var everything: Array = await list(limit, progress)
+	var mine: Array = []
+	for entry: Variant in everything:
+		if str((entry as Dictionary).get("handle", "")).strip_edges().to_lower() == wanted:
+			mine.append(entry)
+
+	if mine.is_empty() and last_error.is_empty():
+		last_error = "Nothing is listed under '%s'." % handle
+	return mine
+
+
 static func _newest_first(a: Dictionary, b: Dictionary) -> bool:
 	return int(a.get("sealed_at", 0)) > int(b.get("sealed_at", 0))
-
-
-func _ready() -> bool:
-	if client == null or not client.is_available():
-		last_error = "Not attached to a host."
-		return false
-	if db_root_id.strip_edges().is_empty():
-		last_error = "No root is set."
-		return false
-	return true

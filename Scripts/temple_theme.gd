@@ -95,6 +95,18 @@ static func _style_buttons(theme: Theme) -> void:
 	theme.set_color("font_focus_color", "CheckBox", WHITE)
 	theme.set_color("font_disabled_color", "CheckBox", MUTED)
 
+	# The box itself is an icon, and its colour is a theme item separate from
+	# the label's. Left at the default it drew near-black on black, so an
+	# unticked box was invisible and the only way to read the state was to tick
+	# it. Unticked is deliberately the brightest: an option you cannot see is
+	# an option you cannot knowingly decline.
+	theme.set_color("icon_normal_color", "CheckBox", WHITE)
+	theme.set_color("icon_hover_color", "CheckBox", YELLOW)
+	theme.set_color("icon_pressed_color", "CheckBox", YELLOW)
+	theme.set_color("icon_hover_pressed_color", "CheckBox", YELLOW)
+	theme.set_color("icon_focus_color", "CheckBox", WHITE)
+	theme.set_color("icon_disabled_color", "CheckBox", MUTED)
+
 
 static func _style_inputs(theme: Theme) -> void:
 	theme.set_stylebox("normal", "LineEdit", _outline(DARK_GREY, BLACK))
@@ -160,6 +172,24 @@ static func line(text: String, colour: Color = GREY, size: int = SIZE_BODY) -> L
 	label.add_theme_color_override("font_color", colour)
 	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	return label
+
+
+## One row of a table: left-aligned and never wrapped.
+##
+## line() wraps, which is right for prose and wrong for a padded column layout.
+## Squeezed into a narrow container a padded string has no spaces to break on,
+## so word-wrap degrades to breaking after single characters and the table
+## becomes a column of letters. These clip instead.
+static func cell(text: String, colour: Color = GREY, size: int = SIZE_SMALL) -> Label:
+	var label := Label.new()
+	label.text = text
+	label.add_theme_font_size_override("font_size", size)
+	label.add_theme_color_override("font_color", colour)
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	label.autowrap_mode = TextServer.AUTOWRAP_OFF
+	label.clip_text = true
+	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	return label
 
 

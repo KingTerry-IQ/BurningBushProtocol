@@ -14,6 +14,28 @@ extends RefCounted
 const PROTOCOL := "burning-bush/1"
 const CIPHER := "AES-256-CBC"
 
+## Every table this protocol creates lives under this one root.
+##
+## One root for the whole app rather than one per keeper. The root's creator
+## is paid the table-creation fee, so this routes those fees to the protocol
+## instead of each keeper paying themselves.
+##
+## Two properties of that root are load-bearing and must not change:
+##
+##   Its table-creator list stays EMPTY. The program lets a root's creator
+##   restrict who may create tables under it, which here would be the power to
+##   stop a keeper lighting their own flame — a kill switch on a dead man's
+##   switch. It is deliberately never set.
+##
+##   Each flame table still carries its own writer whitelist. A shared root
+##   does not share write access: only the keeper's wallet can tend their own
+##   flame, enforced by the program.
+##
+## Covenants sealed before this carry their old per-keeper root in their own
+## record and keep working; nothing is migrated, because nothing on-chain can
+## be moved.
+const APP_ROOT := "GodOnChain-KingTerry-BurningBushProtocol"
+
 ## How the key comes back. These combine: a tablet may do both, in which case
 ## whichever happens first opens it.
 enum Release {
@@ -68,13 +90,77 @@ var public_listing: bool = false
 var signature: String = ""
 var sealed_at: int = 0
 
+## The wallet that sealed this and is the only one permitted to tend it.
+##
+## Deliberately NOT inscribed. Writing it into the record would be a claim the
+## record makes about itself, and anyone can inscribe any address they like.
+## The trustworthy answer is who *signed* the inscription, which the chain
+## attests and the host reports — so this is a cache of that, resolved once and
+## kept locally, not an assertion carried on-chain.
+##
+## It is also written into the flame table's writer list at creation, so on a
+## new covenant the chain refuses anybody else outright.
+var keeper_wallet: String = ""
+
+## Legacy fallback for covenants sealed before keeper_wallet was recorded.
+##
+## Local only, and deliberately weaker: a boolean in a file this machine owns
+## proves nothing to anybody, which is exactly why it is not the authority.
+## is_kept_by() prefers the wallet whenever there is one.
+var mine: bool = false
+
 # Ciphertext
 var iv_hex: String = ""
 var ciphertext_b64: String = ""
 
 
+## Whether `wallet` is the one that may tend this flame.
+##
+## The wallet decides, not a local flag: a covenant is tended by the keypair
+## that sealed it, on a table only that keypair can write to. Falls back to
+## the old local flag only when the covenant predates the wallet being
+## recorded, and treats an unknown wallet as "not ours" — withholding CHECK IN
+## is a recoverable mistake, forging proof of life is not.
+func is_kept_by(wallet: String) -> bool:
+	if keeper_wallet.is_empty():
+		return mine
+	return not wallet.is_empty() and wallet.strip_edges() == keeper_wallet
+
+
 func days_until_dark() -> int:
 	return interval_days + grace_days
+
+
+## How long until a deadline: "in 27d", "in 5h", "in 12m", or "now".
+##
+## The unit follows the urgency. Days are the right grain for a covenant with
+## a month to run and useless for one with forty minutes left — and the last
+## hours before release are exactly when a keeper needs to read the number and
+## act on it.
+##
+## Never a negative count: a deadline three days past has not got -3 days left,
+## it has passed, and a keeper reading the list needs to see that at a glance.
+static func in_time(seconds: int) -> String:
+	if seconds <= 0:
+		return "now"
+	if seconds < 3600:
+		return "in %dm" % maxi(1, seconds / 60)
+	if seconds < 86400:
+		return "in %dh" % (seconds / 3600)
+	return "in %dd" % (seconds / 86400)
+
+
+## How long since something happened: "3d ago", "5h ago", "12m ago", "just now".
+static func since_time(seconds: int) -> String:
+	if seconds < 0:
+		return "never"
+	if seconds < 60:
+		return "just now"
+	if seconds < 3600:
+		return "%dm ago" % (seconds / 60)
+	if seconds < 86400:
+		return "%dh ago" % (seconds / 3600)
+	return "%dd ago" % (seconds / 86400)
 
 
 func has(mode: Release) -> bool:
@@ -158,16 +244,30 @@ func routes() -> Array:
 	return out
 
 
+## The units a puzzle's duration may be given in, and what each is worth in
+## seconds. Days alone was too coarse to calibrate a puzzle before trusting one
+## with a year, so the smallest is a minute. This lives here rather than in the
+## seal screen because timelock_duration() below has to agree with it.
+const DURATION_UNITS := [["minutes", 60], ["hours", 3600], ["days", 86400]]
+const DURATION_DEFAULT_UNIT := 2
+
+
 ## How long the puzzle was calibrated to take, in words.
 func timelock_duration() -> String:
 	var seconds := int(timelock.get("estimatedSeconds", 0))
 	if seconds <= 0:
 		return "an unknown amount"
 	if seconds < 3600:
-		return "%d minutes" % maxi(1, seconds / 60)
+		return _plural(maxi(1, seconds / 60), "minute")
 	if seconds < 86400:
-		return "%d hours" % (seconds / 3600)
-	return "%d days" % (seconds / 86400)
+		return _plural(seconds / 3600, "hour")
+	return _plural(seconds / 86400, "day")
+
+
+## "1 day", "30 days". A one-day puzzle read as "1 days", which is the sort of
+## thing that makes a careful reader wonder what else was not thought through.
+static func _plural(count: int, unit: String) -> String:
+	return "%d %s" % [count, unit if count == 1 else unit + "s"]
 
 
 ## Human summary of how this one opens.
@@ -235,6 +335,10 @@ static func from_record(record: Dictionary) -> Tablet:
 	tablet.keeper = str(record.get("keeper", ""))
 	tablet.chain = str(record.get("chain", "sol"))
 	tablet.db_root_id = str(record.get("root", ""))
+	# Absent from anything read off-chain, and from index entries written
+	# before this flag existed. Ark.load_index() settles those.
+	tablet.keeper_wallet = str(record.get("keeper_wallet", "")).strip_edges()
+	tablet.mine = bool(record.get("mine", false))
 	tablet.interval_days = int(record.get("interval_days", 30))
 	tablet.grace_days = int(record.get("grace_days", 60))
 	tablet.sealed_at = int(record.get("sealed_at", 0))
@@ -262,6 +366,11 @@ static func from_record(record: Dictionary) -> Tablet:
 func to_index() -> Dictionary:
 	var entry := to_record()
 	entry["signature"] = signature
+	# Kept in the local index only, never in the inscribed record above.
+	entry["mine"] = mine
+	# A cache of who signed the inscription, so it is resolved once per machine
+	# rather than on every refresh.
+	entry["keeper_wallet"] = keeper_wallet
 	# The ciphertext is already on-chain; no reason to keep a second copy.
 	entry.erase("ciphertext")
 	return entry

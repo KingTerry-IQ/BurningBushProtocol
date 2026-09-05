@@ -83,7 +83,6 @@ static func sealing_warning(witnesses: int, threshold: int) -> String:
 		+ "Its contents stay shut only while fewer than %d of the %d fragments "
 		+ "are brought together. Give one fragment to each witness, keep none "
 		+ "yourself, and do not write the key down.\n\n"
-		+ "Never seal another person's private matters. There is no unpublish."
 	) % [threshold, witnesses]
 
 

@@ -43,11 +43,23 @@ var table_name: String = "flame"
 
 var last_error: String = ""
 
+## This flame's table, addressed through its root. Built on demand and asked
+## for the right chain per call, so nothing has to be rebuilt when a Flame's
+## fields are set one at a time.
+var _space: IQSpace = null
+
 
 func _init(iq: IQClient = null, root: String = "", target_chain: String = "sol") -> void:
 	client = iq
 	db_root_id = root
 	chain = target_chain
+
+
+## The space this flame's table lives in, on this flame's chain.
+func space() -> IQSpace:
+	if _space == null or _space.root != db_root_id:
+		_space = IQSpace.new(client, db_root_id, chain)
+	return _space.on(chain)
 
 
 ## Total days of silence before the covenant may be opened.
@@ -67,18 +79,40 @@ static func releasable(state: State) -> bool:
 
 #region Writing
 
+## The table options that lock a flame to a single writer.
+##
+## Returns {} when there is no wallet to name, deliberately rather than an
+## empty list: the program ignores an empty writer list and treats the table as
+## open to anyone, so sending one would look like protection while providing
+## none. Better to send nothing and have the caller notice.
+static func writer_options(keeper_wallet: String) -> Dictionary:
+	var owner := keeper_wallet.strip_edges()
+	return {"writers": [owner]} if not owner.is_empty() else {}
+
+
 ## Creates the flame table. Only needed once per keeper, and it spends.
 ## Returns the host's result, or null if refused or failed.
-func kindle(progress: Callable = Callable()) -> Variant:
+##
+## `keeper_wallet` becomes the table's only permitted writer, and this is the
+## load-bearing part. Both SDKs enforce a writer list inside the program — but
+## only when it is non-empty, so a table created without one accepts a row from
+## anybody. On a proof-of-life table that is not a small hole: a stranger could
+## keep a dead keeper's flame burning forever and the covenant would never
+## release, which is the single failure this whole design exists to prevent.
+##
+## It cannot be added afterwards. A table already created without a writer list
+## stays writable by anyone for as long as it exists.
+func kindle(keeper_wallet: String = "", progress: Callable = Callable()) -> Variant:
 	if not _ready():
 		return null
-	var result = await client.create_table(
-		db_root_id, table_name, PackedStringArray(COLUMNS), ID_COLUMN, chain, {}, progress
+
+	var owner := keeper_wallet.strip_edges()
+	var writers: PackedStringArray = [owner] if not owner.is_empty() else []
+	var result = await space().create_table(
+		table_name, PackedStringArray(COLUMNS), ID_COLUMN, writers, progress
 	)
 	if result == null:
-		last_error = client.last_error
-	else:
-		ChainTable.forget(db_root_id, table_name, chain)
+		last_error = space().last_error
 	return result
 
 
@@ -91,14 +125,9 @@ func kindle(progress: Callable = Callable()) -> Variant:
 func exists_on_chain() -> bool:
 	if client == null or not client.is_available():
 		return false
-	ChainTable.forget(db_root_id, table_name, chain)
-	var problem: Array = []
-	var rows: Dictionary = await ChainTable.read_rows(
-		client, db_root_id, table_name, chain, 1, problem
-	)
-	if not rows.is_empty():
+	if await space().table_exists(table_name):
 		return true
-	last_error = str(problem[0]) if not problem.is_empty() else "The table is not there."
+	last_error = "The table is not there."
 	return false
 
 
@@ -127,24 +156,34 @@ func tend(note: String = "", progress: Callable = Callable()) -> Variant:
 ##
 ## Returns {state, last_ts, days_since, days_left, entries}. `days_left` counts
 ## down to DARK and goes negative once passed.
-func read_status(limit: int = 20, progress: Callable = Callable()) -> Dictionary:
+## `keeper` is the wallet whose rows count. Give it and rows signed by anyone
+## else are ignored, which is what makes a flame trustworthy on a table created
+## without a writer list — those accept a row from anybody, and a stranger
+## writing one would otherwise keep a dead keeper's flame burning for ever.
+##
+## Leave it empty and every row counts, which is the old behaviour.
+func read_status(
+	limit: int = 20, progress: Callable = Callable(), keeper: String = ""
+) -> Dictionary:
 	var unknown := {
 		"state": State.UNKNOWN,
 		"last_ts": 0,
 		"days_since": -1,
 		"days_left": 0,
 		"entries": [],
+		"unverified": 0,
 	}
 
 	if not _ready():
 		return unknown
 
 	var problem: Array = []
-	var rows: Dictionary = await ChainTable.read_rows(
-		client, db_root_id, table_name, chain, limit, problem, progress
+	var want_signers := not keeper.strip_edges().is_empty()
+	var entries: Array = await space().read_rows(
+		table_name, limit, problem, progress, want_signers
 	)
 
-	if rows.is_empty():
+	if entries.is_empty():
 		last_error = str(problem[0]) if not problem.is_empty() else "Could not read the flame."
 		# We reached the host and it had nothing for us, which in practice means
 		# the table has not been created — the flame was never lit. UNKNOWN is
@@ -155,7 +194,11 @@ func read_status(limit: int = 20, progress: Callable = Callable()) -> Dictionary
 		never["state"] = State.NEVER_LIT
 		return never
 
-	var entries: Array = ChainTable.rows_of(rows)
+	var unverified := 0
+	if want_signers:
+		var sifted := _only_from(entries, keeper.strip_edges())
+		entries = sifted["entries"]
+		unverified = int(sifted["unverified"])
 	if entries.is_empty():
 		var never := unknown.duplicate()
 		never["state"] = State.NEVER_LIT
@@ -192,10 +235,39 @@ func read_status(limit: int = 20, progress: Callable = Callable()) -> Dictionary
 		"days_since": days_since,
 		"days_left": days_until_dark() - days_since,
 		"entries": entries,
+		"unverified": unverified,
 	}
 
 
 #endregion
+
+
+## Keeps only the rows the keeper signed for.
+##
+## Two kinds of row are dropped and one is deliberately kept:
+##
+##   signed by someone else  dropped. This is the forgery being defended
+##                           against, and it is unambiguous.
+##   signer unknown          KEPT, and counted in "unverified". The host could
+##                           not resolve it — usually a slow or rate-limited
+##                           RPC — and dropping it would darken a flame its
+##                           keeper is faithfully tending. Between the two ways
+##                           of being wrong, a covenant that releases early
+##                           cannot be undone, while one that releases late is
+##                           at least still shut.
+##   signed by the keeper    kept.
+static func _only_from(entries: Array, keeper: String) -> Dictionary:
+	var kept: Array = []
+	var unverified := 0
+	for entry: Variant in entries:
+		var row: Dictionary = entry
+		var signer := str(row.get("__signer", "")).strip_edges()
+		if signer.is_empty():
+			unverified += 1
+			kept.append(row)
+		elif signer == keeper:
+			kept.append(row)
+	return {"entries": kept, "unverified": unverified}
 
 
 func _ready() -> bool:

@@ -20,6 +20,8 @@ var client: IQClient
 var tablet: Tablet
 var last_error: String = ""
 
+var _cached: IQSpace = null
+
 
 func _init(iq: IQClient = null, for_tablet: Tablet = null) -> void:
 	client = iq
@@ -30,24 +32,29 @@ func table_name() -> String:
 	return tablet.testimony_table()
 
 
+## This tablet's space, on this tablet's chain.
+func _space() -> IQSpace:
+	if _cached == null or _cached.root != tablet.db_root_id:
+		_cached = IQSpace.new(client, tablet.db_root_id, tablet.chain)
+	return _cached.on(tablet.chain)
+
+
 ## Creates the table witnesses will testify into. The keeper does this when
 ## building the altar, so it stands ready long before it is needed.
 func prepare(progress: Callable = Callable()) -> Variant:
 	if not _ready():
 		return null
-	var result = await client.create_table(
-		tablet.db_root_id,
-		table_name(),
-		PackedStringArray(COLUMNS),
-		ID_COLUMN,
-		tablet.chain,
-		{},
-		progress
+	# Deliberately no writer whitelist. Any named witness must be able to
+	# testify, and they are not known as wallet addresses here — a witness is
+	# identified by their encryption identity, which is a different key. The
+	# safeguard is that a fragment has to decrypt correctly to be worth
+	# anything, so a stranger's row is noise rather than a forgery.
+	var here := _space()
+	var result = await here.create_table(
+		table_name(), PackedStringArray(COLUMNS), ID_COLUMN, PackedStringArray(), progress
 	)
 	if result == null:
-		last_error = client.last_error
-	else:
-		ChainTable.forget(tablet.db_root_id, table_name(), tablet.chain)
+		last_error = here.last_error
 	return result
 
 
@@ -68,11 +75,10 @@ func testify(
 		"witness": witness_label.strip_edges(),
 	}
 
-	var result = await client.write_row(
-		tablet.db_root_id, table_name(), row, tablet.chain, {}, progress
-	)
+	var here := _space()
+	var result = await here.write_row(table_name(), row, progress)
 	if result == null:
-		last_error = client.last_error
+		last_error = here.last_error
 	return result
 
 
@@ -86,9 +92,7 @@ func gather(progress: Callable = Callable()) -> Dictionary:
 		return empty
 
 	var problem: Array = []
-	var rows: Dictionary = await ChainTable.read_rows(
-		client, tablet.db_root_id, table_name(), tablet.chain, 64, problem, progress
-	)
+	var rows: Array = await _space().read_rows(table_name(), 64, problem, progress)
 	if rows.is_empty():
 		# No table and no rows are both just "nobody has testified".
 		last_error = str(problem[0]) if not problem.is_empty() else ""
@@ -98,7 +102,7 @@ func gather(progress: Callable = Callable()) -> Dictionary:
 	var witnesses: Array = []
 	var seen := {}
 
-	for entry: Variant in ChainTable.rows_of(rows):
+	for entry: Variant in rows:
 		var record: Dictionary = entry
 		var hex := str(record.get("fragment", "")).strip_edges()
 		var fragment := Shamir.from_hex(hex)

@@ -23,9 +23,16 @@ var states: Dictionary = {}
 
 var last_error: String = ""
 
+## This keeper's own records root, used only to settle index entries written
+## before covenants recorded who sealed them. Empty means "assume nothing is
+## ours", which is the safe direction: it withholds CHECK IN rather than
+## offering it over someone else's flame.
+var owner_root: String = ""
 
-func _init(iq: IQClient = null) -> void:
+
+func _init(iq: IQClient = null, root: String = "") -> void:
 	client = iq
+	owner_root = root.strip_edges()
 	load_index()
 
 
@@ -63,8 +70,21 @@ func find(id: String) -> Tablet:
 ## A fresh id. Human-readable so it can be recognised in a table name.
 static func mint_id(title: String) -> String:
 	var stamp := str(Time.get_unix_time_from_system())
-	var slug := Tablet.slug(title if not title.strip_edges().is_empty() else "tablet")
-	return "%s_%s" % [slug, stamp.substr(stamp.length() - 6)]
+	var named := Tablet.slug(title if not title.strip_edges().is_empty() else "tablet")
+
+	# Under one shared root every keeper's tables sit in the same namespace, so
+	# an id has to be unique across keepers rather than merely within one. A
+	# timestamp alone collides when two people seal in the same second.
+	#
+	# The whole thing is kept under 24 characters because slug() truncates
+	# there when the table name is built — long titles used to have their
+	# unique suffix cut off entirely, which collided even for a single keeper.
+	# 32 bits of salt, not 16. Sixteen looks ample against "two keepers sealing
+	# in the same second", but the birthday bound bites once ids are drawn in
+	# any quantity — roughly a one-in-four chance of a repeat across 200 — and
+	# a repeat here means two covenants sharing one flame table.
+	var salt := "%08x" % randi()
+	return "%s_%s%s" % [named.substr(0, 8), stamp.substr(stamp.length() - 6), salt]
 
 #endregion
 
@@ -81,12 +101,36 @@ func refresh(progress: Callable = Callable()) -> Array[Tablet]:
 
 	for tablet: Tablet in tablets:
 		var flame := flame_for(tablet)
-		var status := await flame.read_status(5, progress)
+		var status := await flame.read_status(5, progress, await author_of(tablet))
 		states[tablet.id] = status
 		if int(status.get("state", Flame.State.UNKNOWN)) == Flame.State.DARK:
 			dark.append(tablet)
 
 	return dark
+
+
+## Whose covenant this is, according to the chain.
+##
+## The answer is the wallet that signed the inscription — not anything the
+## tablet says about itself, because a record can name any address its author
+## fancies while a signature cannot. The host reports it from the transaction,
+## for both chains.
+##
+## Cached on the tablet after the first lookup, since it can never change: the
+## inscription is immutable, so its signer is too. Returns "" when it cannot be
+## resolved, which callers must read as "unknown", never as "nobody".
+func author_of(tablet: Tablet) -> String:
+	if not tablet.keeper_wallet.is_empty():
+		return tablet.keeper_wallet
+	if client == null or not client.is_available() or tablet.signature.is_empty():
+		return ""
+
+	var meta: Dictionary = await client.read_metadata(tablet.signature, tablet.chain)
+	var signer := str(meta.get("signer", "")).strip_edges()
+	if not signer.is_empty():
+		tablet.keeper_wallet = signer
+		save_index()
+	return signer
 
 
 ## The flame belonging to one tablet. Each has its own table.
@@ -106,6 +150,15 @@ func state_of(tablet: Tablet) -> Flame.State:
 func days_since(tablet: Tablet) -> int:
 	var status: Dictionary = states.get(tablet.id, {})
 	return int(status.get("days_since", -1))
+
+
+## When the flame was last tended, as a unix time. 0 when never or unknown.
+##
+## Whole days are too coarse for the hours before a release, which is when the
+## number matters most, so callers that display a countdown work from this.
+func last_tended(tablet: Tablet) -> int:
+	var status: Dictionary = states.get(tablet.id, {})
+	return int(status.get("last_ts", 0))
 
 
 ## Tablets whose flame is dark, newest silence first. These are the ones that
@@ -164,8 +217,17 @@ func load_index() -> void:
 	if not parsed is Array:
 		return
 	for entry: Variant in parsed:
-		if entry is Dictionary:
-			tablets.append(Tablet.from_record(entry))
+		if not entry is Dictionary:
+			continue
+		var record: Dictionary = entry
+		var tablet := Tablet.from_record(record)
+		# Entries written before covenants recorded who sealed them: fall back
+		# to the root they live under. A keeper's own covenants sit under their
+		# own root, and nobody else's do, so this restores CHECK IN where it
+		# belongs without ever granting it over a stranger's flame.
+		if not record.has("mine"):
+			tablet.mine = not owner_root.is_empty() and tablet.db_root_id == owner_root
+		tablets.append(tablet)
 
 
 func save_index() -> void:
@@ -187,16 +249,29 @@ func save_index() -> void:
 ## over by some channel that has to survive the keeper.
 ##
 ## Returns entries of {tablet, state, days_since, i_am_witness, already_held}.
+## Everything one keeper has listed, without adopting any of it.
+##
+## `handle` is the keeper's chosen name for their records — short and durable,
+## unlike a signature per covenant handed over by some channel that has to
+## outlive the keeper. Empty lists everyone.
+##
+## Returns entries of {tablet, state, days_since, i_am_witness, already_held}.
 func survey(
-	root: String, chain: String, my_identity: String, progress: Callable = Callable()
+	handle: String, chain: String, my_identity: String, progress: Callable = Callable()
 ) -> Array:
 	var found: Array = []
 	if client == null or not client.is_available():
 		last_error = "Not attached to a host."
 		return found
 
-	var registry := Registry.new(client, root, chain)
-	var listed := await registry.list(50, progress)
+	var registry := Registry.new(client, chain)
+	# One shared registry now, so "what has this keeper listed" is a filter on
+	# the handle rather than a different table under a different root.
+	var listed: Array = (
+		await registry.list(50, progress)
+		if handle.strip_edges().is_empty()
+		else await registry.for_handle(handle, 100, progress)
+	)
 	if listed.is_empty():
 		last_error = registry.last_error
 		return found
@@ -210,7 +285,9 @@ func survey(
 		# Reading the flame is free, so the survey can show state immediately
 		# rather than making the reader adopt something to find out.
 		var flame := flame_for(tablet)
-		var status := await flame.read_status(5)
+		# Someone else's covenant, so its author has to be resolved from the
+		# chain — there is no local cache for one we have never held.
+		var status := await flame.read_status(5, Callable(), await author_of(tablet))
 
 		var testimony := Testimony.new(client, tablet)
 		found.append({
@@ -226,12 +303,13 @@ func survey(
 	return found
 
 
-## The shared commons: covenants their keepers chose to list publicly.
+## Everything anyone has listed. The commons.
 ##
-## This is the only view that reaches across keepers. Everything else needs a
-## root you were given.
+## Same table as survey() reads, without the handle filter: under one app root
+## the difference between "this keeper's listings" and "everyone's" is which
+## rows you keep, not which table you open.
 func browse(chain: String, my_identity: String, progress: Callable = Callable()) -> Array:
-	return await survey(Registry.COMMONS_ROOT, chain, my_identity, progress)
+	return await survey("", chain, my_identity, progress)
 
 
 ## Fetches and parses a tablet without adding it to the ark.
