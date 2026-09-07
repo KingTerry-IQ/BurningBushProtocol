@@ -45,6 +45,15 @@ static func state_gloss(state: Flame.State, days_left: int) -> String:
 			return "Could not read the flame. This says nothing about the keeper."
 
 
+## Shown at the foot of a puzzle while it is being ground out.
+##
+## A window whose whole content is one number needs something that says which
+## program it belongs to and what it is doing there — the same job the oracle
+## does along the bottom of the app.
+static func puzzle_verse() -> String:
+	return "THE MOUNTAIN IS CLIMBED ONE SQUARING AT A TIME."
+
+
 ## TempleOS-style oracle, drawn at random. Terry pulled words from a dictionary
 ## and read God in the result; these are hand-picked, which is cheating, but the
 ## machine is not going to know the difference.

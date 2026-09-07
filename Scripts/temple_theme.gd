@@ -118,7 +118,13 @@ static func _style_inputs(theme: Theme) -> void:
 
 	theme.set_stylebox("normal", "TextEdit", _outline(DARK_GREY, BLACK))
 	theme.set_stylebox("focus", "TextEdit", _outline(YELLOW, BLACK))
+	# A box showing something that must not be edited is still a box on black.
+	# Left to the default, read_only drew a pale grey slab — which is where the
+	# opened word lands, so the one thing worth reading was the one thing not
+	# drawn in the app's colours.
+	theme.set_stylebox("read_only", "TextEdit", _outline(DARK_GREY, BLACK))
 	theme.set_color("font_color", "TextEdit", WHITE)
+	theme.set_color("font_readonly_color", "TextEdit", WHITE)
 	theme.set_color("caret_color", "TextEdit", YELLOW)
 
 	theme.set_stylebox("normal", "SpinBox", _outline(DARK_GREY, BLACK))

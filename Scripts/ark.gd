@@ -93,7 +93,12 @@ static func mint_id(title: String) -> String:
 
 ## Reads every flame. Returns the tablets whose flame has gone dark, so the
 ## caller can lead with them.
-func refresh(progress: Callable = Callable()) -> Array[Tablet]:
+##
+## Each flame is its own round trip, so a keeper with a dozen covenants waits a
+## dozen of them for a single answer. `each` is called with a tablet the moment
+## its own reading lands, so a caller can show that one straight away instead of
+## holding every answer back until the last has come in.
+func refresh(progress: Callable = Callable(), each: Callable = Callable()) -> Array[Tablet]:
 	var dark: Array[Tablet] = []
 	if client == null or not client.is_available():
 		last_error = "Not attached to a host."
@@ -105,6 +110,8 @@ func refresh(progress: Callable = Callable()) -> Array[Tablet]:
 		states[tablet.id] = status
 		if int(status.get("state", Flame.State.UNKNOWN)) == Flame.State.DARK:
 			dark.append(tablet)
+		if each.is_valid():
+			each.call(tablet)
 
 	return dark
 

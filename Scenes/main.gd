@@ -25,6 +25,21 @@ extends Control
 
 const CONFIG_PATH := "user://covenant.cfg"
 
+## How long to leave between two transactions in the same ceremony, and how
+## many times to ask whether what one wrote has appeared.
+##
+## Sealing a covenant is now four or five writes in a row, and a chain will not
+## take them all at once: the next one is built against a state the last has not
+## landed in yet, and it fails outright rather than queueing. Nothing in a
+## ceremony is urgent — nobody is watching a clock that runs in months — so
+## waiting costs nothing, and not waiting costs a half-made covenant.
+##
+## Eight tries at two and a half seconds is twenty seconds of patience per
+## step, which covers a slow block without leaving the keeper staring at a
+## screen that says nothing.
+const SETTLE_SECONDS := 2.5
+const SETTLE_TRIES := 8
+
 ## Column widths for the list. Monospaced, so padding is alignment.
 ##
 ## Kept narrow enough that a row never needs horizontal scrolling: the list is
@@ -94,7 +109,7 @@ var _progress_shown := -1
 var _witness_rows: Array = []
 ## This wallet's public encryption identity, fetched once on connect.
 var _my_identity: String = ""
-## Our wallet address per chain, e.g. {"sol": "Fid…", "mon": "0x8F…"}.
+## Our wallet address per chain, e.g. {"sol": "Fid…", "mon": "0x8F…", "rh": "0x8F…"}.
 ##
 ## The addresses differ by chain, so a covenant is ours only when it matches
 ## the one for its own chain. Read from the host, never stored: it follows
@@ -119,6 +134,10 @@ var _seal_timelock_unit: OptionButton
 var _open_fragments: TextEdit
 var _open_result: Label
 var _solving_timelock := false
+## The window watching the climb, while there is one. A solve runs for hours or
+## days, so it gets somewhere of its own to report from rather than a line on a
+## panel the reader has to keep open.
+var _solver: SolverWindow = null
 ## Polls for a host while unattached, so starting GodOnChain later just works.
 var _host_watch: Timer
 var _settings_fields: Dictionary = {}
@@ -229,7 +248,9 @@ func _refresh() -> void:
 	_set_busy(true)
 	_say("Reading %d flame(s)..." % ark.tablets.size(), TempleTheme.GREY)
 
-	var dark := await ark.refresh()
+	var dark := await ark.refresh(Callable(), _repaint_row)
+	# One regrouping at the end. The rows have been answering one by one as they
+	# came in; this is where the dark ones move to the top.
 	_rebuild_list()
 
 	if not dark.is_empty():
@@ -296,6 +317,36 @@ func _retry_connect() -> void:
 
 
 #region The Ark list
+
+## Repaints one row where it stands, without rebuilding the list.
+##
+## Reading a flame is a round trip each, so a keeper with a dozen covenants used
+## to watch a column of UNKNOWN for several seconds and then have every answer
+## arrive at once. Now each lands as it comes.
+##
+## In place, deliberately: a full rebuild would regroup dark-first on every
+## answer, and rows that jump while a list is being read are worse than rows
+## that fill in. The regrouping happens once, when the reading is done.
+func _repaint_row(tablet: Tablet) -> void:
+	if list_box == null:
+		return
+
+	var state := ark.state_of(tablet)
+	for child: Node in list_box.get_children():
+		if child.is_queued_for_deletion() or not child is Button:
+			continue
+		var row: Button = child
+		if str(row.get_meta("tablet_id", "")) != tablet.id:
+			continue
+		row.text = _row_text(tablet, state)
+		row.add_theme_color_override("font_color", _state_colour(state))
+		break
+
+	# The bush is showing this one, so it should light with it rather than wait
+	# for the rest of the ark to answer.
+	if tablet.id == selected_id:
+		_paint_selected()
+
 
 func _rebuild_list() -> void:
 	if list_box == null:
@@ -542,39 +593,105 @@ func _on_tend() -> void:
 		return
 
 	_set_busy(true)
+	await _tend_tablet(tablet)
+	_rebuild_list()
+	_set_busy(false)
+
+
+## A pause between two things the chain has to do in order.
+func _pause(seconds: float) -> void:
+	await get_tree().create_timer(seconds).timeout
+
+
+## Waits for a table that was just created to actually be there.
+##
+## A completed job means the host finished its work, not that the chain has
+## caught up: the transaction still has to confirm, and the node answering the
+## next question still has to have seen it. Asking once and taking "no" for an
+## answer reports a perfectly good table as a reverted transaction — and
+## writing the first row into that same gap is the transaction error that
+## sealing, preparing and checking in back to back used to produce.
+func _await_table(flame: Flame, title: String) -> bool:
+	for attempt in SETTLE_TRIES:
+		if await flame.exists_on_chain():
+			return true
+		if attempt == 0:
+			_say("  Waiting for the chain to catch up with '%s'." % title, TempleTheme.GREY)
+		if attempt < SETTLE_TRIES - 1:
+			await _pause(SETTLE_SECONDS)
+	return false
+
+
+## Writes one proof-of-life row for this tablet and reads it back. Returns
+## whether the row was written, which is what actually lights the flame — the
+## chain may take a further moment to show it.
+##
+## Split out from the button because sealing checks in the moment the altar
+## stands: a covenant whose flame has never been lit reads as UNLIT to every
+## witness, and leaving that to a second press left new covenants keeping
+## nothing while their keeper believed otherwise.
+##
+## `retries` is for the check-in that follows straight on from building the
+## altar, which can be refused for no better reason than arriving too soon
+## behind the transaction that created the table it writes to.
+func _tend_tablet(tablet: Tablet, retries: int = 0) -> bool:
 	var flame := ark.flame_for(tablet)
 
-	# Writing a row to a table that does not exist reverts, which on Monad
-	# costs real money and achieves nothing. Look first.
-	if not await flame.exists_on_chain():
+	# Writing a row to a table that does not exist reverts, which on an EVM
+	# chain costs real money and achieves nothing. Look first.
+	#
+	# When this follows straight on from building the altar — which is what a
+	# retry means here — the table may still be on its way, so wait for it
+	# rather than announce it missing to a keeper who just paid for it.
+	var there := false
+	if retries > 0:
+		there = await _await_table(flame, tablet.title)
+	else:
+		there = await flame.exists_on_chain()
+	if not there:
 		_say(
 			"'%s' has no flame table on %s yet, so there is nothing to write to. "
 			% [tablet.title, tablet.chain.to_upper()]
 			+ "Press PREPARE first.",
 			TempleTheme.BRIGHT_RED
 		)
-		_set_busy(false)
-		return
+		return false
 
 	var result = await flame.tend("", _writing("Checking in"))
 	if result == null:
-		_say(flame.last_error, TempleTheme.BRIGHT_RED)
-	else:
-		# Right after a check-in, so verify it the same way a refresh would.
-		ark.states[tablet.id] = await flame.read_status(
-			5, Callable(), await ark.author_of(tablet)
-		)
-		var state: Flame.State = ark.states[tablet.id].get("state", Flame.State.UNKNOWN)
-		if state == Flame.State.NEVER_LIT:
+		if retries > 0:
 			_say(
-				"The write completed but no check-in can be read back. It may "
-				+ "need a moment to settle — press REFRESH shortly.",
+				"That did not go through: %s. Waiting for the chain, then "
+				% flame.last_error
+				+ "trying once more.",
 				TempleTheme.AMBER
 			)
-		else:
+			await _pause(SETTLE_SECONDS * 2.0)
+			return await _tend_tablet(tablet, retries - 1)
+		_say(flame.last_error, TempleTheme.BRIGHT_RED)
+		return false
+
+	# Right after a check-in, so verify it the same way a refresh would — and
+	# patiently, because a row is not readable the instant its transaction
+	# lands. Reads cost nothing, so waiting here costs only time.
+	var author := await ark.author_of(tablet)
+	for attempt in SETTLE_TRIES:
+		ark.states[tablet.id] = await flame.read_status(5, Callable(), author)
+		if ark.state_of(tablet) != Flame.State.NEVER_LIT:
 			_say("The flame of '%s' is tended." % tablet.title, TempleTheme.CYAN)
-		_rebuild_list()
-	_set_busy(false)
+			return true
+		if attempt == 0:
+			_say("  Written. Waiting for the chain to show it.", TempleTheme.GREY)
+		if attempt < SETTLE_TRIES - 1:
+			await _pause(SETTLE_SECONDS)
+
+	# The row is written and paid for; only the reading back is behind.
+	_say(
+		"The check-in is written, but the chain has not shown it back yet. "
+		+ "Press REFRESH in a minute.",
+		TempleTheme.AMBER
+	)
+	return true
 
 
 func _on_kindle() -> void:
@@ -585,7 +702,7 @@ func _on_kindle() -> void:
 
 	# Building an altar creates tables under the covenant's own root. Under
 	# someone else's root the chain refuses it on Solana and merely takes the
-	# money on Monad, so refuse it here, where refusing is free.
+	# money on the EVM chains, so refuse it here, where refusing is free.
 	if not tablet.is_kept_by(_wallet_for(tablet.chain)):
 		_say(
 			"'%s' is not yours to prepare. Its records live under its keeper's "
@@ -595,24 +712,58 @@ func _on_kindle() -> void:
 		)
 		return
 
-	# Prepare is several writes, and on Monad that is real money. Say so before
-	# starting rather than after the third approval prompt.
-	# Priced per call: table creations are the expensive part, the listing rows
-	# are small and cheap.
-	var tables := 2
-	if tablet.has(Tablet.Release.WITNESSES):
-		tables += 1
-	if tablet.public_listing:
-		tables += 1
-	var rows := 2 if tablet.public_listing else 1
-	var estimate := (
-		Costs.create_table(tablet.chain) * tables + Costs.write_row(tablet.chain) * rows
-	)
-
 	_set_busy(true)
+	# The button is now a retry for a covenant that did not finish being made,
+	# so it carries on into the first check-in the same way sealing does —
+	# unless the flame is already alight, in which case there is nothing owed.
+	var standing := await _prepare_tablet(tablet)
+	if standing and ark.state_of(tablet) != Flame.State.BURNING:
+		# Same as sealing: let the altar land before writing the first row to it.
+		await _pause(SETTLE_SECONDS)
+		await _tend_tablet(tablet, 1)
+	await _refresh()
+	_set_busy(false)
+
+
+## What it costs to make a covenant ready to keep: the tables it needs, the
+## rows that list it, and the first check-in.
+##
+## Priced per call, because the table creations are the expensive part and the
+## rows are small and cheap. Returns {tables, rows, total}.
+func _prepare_cost(chain: String, witnesses: bool, listing: bool) -> Dictionary:
+	var tables := 1
+	if witnesses:
+		tables += 1
+	if listing:
+		# The registry table, which only the first covenant on a chain pays for.
+		tables += 1
+	var rows := 1 if listing else 0
+	return {
+		"tables": tables,
+		"rows": rows,
+		# One row beyond the listing: lighting the flame.
+		"total": Costs.create_table(chain) * tables + Costs.write_row(chain) * (rows + 1),
+	}
+
+
+## Creates everything a covenant needs on-chain: its flame table, the place its
+## witnesses will testify, and its listing. Returns whether the altar stands.
+##
+## Safe to run twice, which is what makes PREPARE a usable retry. Pass `list`
+## false when the caller has just published the listings itself — sealing has —
+## so the same row is not written, and charged for, twice.
+func _prepare_tablet(tablet: Tablet, list: bool = true) -> bool:
+	# Preparing is several writes, and off Solana that is real money. Say so
+	# before starting rather than after the third approval prompt.
+	var cost := _prepare_cost(tablet.chain, tablet.has(Tablet.Release.WITNESSES), list)
 	_say(
-		"Preparing '%s': %d table(s) and %d listing row(s), about %s in total."
-		% [tablet.title, tables, rows, Costs.format(tablet.chain, estimate)],
+		"Preparing '%s': %d table(s) and %d row(s) including the first check-in, about %s in total."
+		% [
+			tablet.title,
+			int(cost["tables"]),
+			int(cost["rows"]) + 1,
+			Costs.format(tablet.chain, float(cost["total"])),
+		],
 		TempleTheme.AMBER
 	)
 
@@ -623,39 +774,55 @@ func _on_kindle() -> void:
 	var keeper_wallet := tablet.keeper_wallet
 	if keeper_wallet.is_empty():
 		keeper_wallet = _wallet_for(tablet.chain)
-	if await flame.kindle(keeper_wallet, _writing("Creating the flame table")) == null:
+
+	# Ask before building. Creating a table that is already there is a
+	# transaction that fails, so a retry after a ceremony that stopped half way
+	# would otherwise pay for the half that worked and report an error for it.
+	var standing := await flame.exists_on_chain()
+	if standing:
+		_say("The altar of '%s' already stands." % tablet.title, TempleTheme.CYAN)
+	elif await flame.kindle(keeper_wallet, _writing("Creating the flame table")) == null:
 		# Keep going: the remaining steps are independent, and abandoning them
 		# here is what left covenants sealed but unlisted.
 		_say("Could not build the altar: %s" % flame.last_error, TempleTheme.BRIGHT_RED)
-	elif not await flame.exists_on_chain():
-		# The job finished but the chain does not have it. A reverted
-		# transaction looks exactly like a successful one from the job's side.
+	elif not await _await_table(flame, tablet.title):
+		# The job finished and the chain still does not have it, twenty seconds
+		# on. Either it was reverted or the chain is having a bad day, and this
+		# cannot tell which — so it says both, and says that trying again is
+		# safe, because the check above will not build a second one.
 		_say(
-			"The write completed but no table appeared on %s. The transaction "
+			"The write completed but no table has appeared on %s. Either the "
 			% tablet.chain.to_upper()
-			+ "was probably reverted — funds were spent and nothing was created. "
-			+ "Check the signer's balance before trying again.",
+			+ "transaction was reverted — funds spent, nothing created — or the "
+			+ "chain is only slow today. Check the signer's balance, then press "
+			+ "PREPARE again: it will not build a second altar if the first arrives.",
 			TempleTheme.BRIGHT_RED
 		)
 	else:
+		standing = true
 		_say("The altar stands, and the chain confirms it.", TempleTheme.CYAN)
 
 	# Witnesses need somewhere to testify, and it must exist long before it is
 	# needed — by then the keeper is not around to build it.
 	if tablet.has(Tablet.Release.WITNESSES):
-		_say("Preparing the place of testimony.", TempleTheme.YELLOW)
 		var testimony := Testimony.new(iq, tablet)
-		if await testimony.prepare() == null:
-			_say(testimony.last_error, TempleTheme.BRIGHT_RED)
+		if await testimony.stands():
+			_say("The place of testimony already stands.", TempleTheme.CYAN)
 		else:
-			_say("It stands ready.", TempleTheme.CYAN)
+			# One transaction at a time: the altar has only just landed.
+			await _pause(SETTLE_SECONDS)
+			_say("Preparing the place of testimony.", TempleTheme.YELLOW)
+			if await testimony.prepare() == null:
+				_say(testimony.last_error, TempleTheme.BRIGHT_RED)
+			else:
+				_say("It stands ready.", TempleTheme.CYAN)
 
 	# Retry anything that did not get listed when it was sealed.
-	await _publish_listings(tablet)
+	if list:
+		await _pause(SETTLE_SECONDS)
+		await _publish_listings(tablet)
 
-	_say("Now check in to light the flame.", TempleTheme.YELLOW)
-	await _refresh()
-	_set_busy(false)
+	return standing
 
 
 ## Makes a covenant findable: under its keeper's own root always, and in the
@@ -674,7 +841,16 @@ func _publish_listings(tablet: Tablet) -> void:
 	# table twice, and charged for twice.
 	var handle := str(config.get("db_root_id", "")).strip_edges()
 	var registry := Registry.new(iq, tablet.chain)
-	await registry.prepare()
+
+	# Only the first covenant on a chain creates the registry. Every one after
+	# it was paying for a transaction that could only fail, because the table it
+	# asks for is already there — and that failure arrived, confusingly, in the
+	# middle of an otherwise successful sealing.
+	if not await registry.stands():
+		await registry.prepare()
+		# The listing row goes into the table that was just created, so give the
+		# chain the same beat it gets everywhere else in the ceremony.
+		await _pause(SETTLE_SECONDS)
 
 	if await registry.publish(tablet, handle) == null:
 		_say(
@@ -1036,7 +1212,7 @@ func _show_seal_panel() -> void:
 	box.add_child(_timelock_panel)
 
 	# 3. Terms. Per covenant, not per app: one may live on Solana and be checked
-	#    weekly, another on Monad and be checked once a year.
+	#    weekly, another on Robinhood Chain and be checked once a year.
 	box.add_child(_section("ITS OWN CLOCK"))
 
 	var chain_row := _labelled(box, "Chain")
@@ -1279,18 +1455,6 @@ func _on_counts_changed(_value: float) -> void:
 				+ "shown once and never stored."
 			)
 
-	if _seal_use_burn.button_pressed:
-		lines.append(
-			"Open to anyone: the key travels in the tablet, so it can be read "
-			+ "from day one. A convention, not a lock."
-		)
-
-	if _seal_use_timelock.button_pressed:
-		lines.append(
-			"Puzzle: the clock starts now, not when your flame goes out, and "
-			+ "faster hardware finishes sooner."
-		)
-
 	if _seal_list_publicly.button_pressed:
 		lines.append("Listed publicly: strangers can find it and watch its clock run down.")
 
@@ -1312,9 +1476,21 @@ func _on_counts_changed(_value: float) -> void:
 	var sealing_chain := str(config["chain"])
 	if _seal_chain != null:
 		sealing_chain = str(CHAINS[maxi(_seal_chain.selected, 0)][1])
+	# SEAL IT does the whole ceremony — inscribe, prepare, first check-in — so
+	# quote the whole ceremony. Quoting only the inscription would leave the
+	# keeper meeting the larger half of the bill unannounced.
+	var seal_cost := Costs.for_bytes(sealing_chain, bytes)
+	# Every covenant is listed so its witnesses can find it, whether or not it
+	# is offered to strangers browsing, so the listing is always in the price.
+	var ready_cost: Dictionary = _prepare_cost(
+		sealing_chain, _seal_use_witnesses.button_pressed, true
+	)
 	lines.append(
-		"Sealing this costs about %s."
-		% Costs.format(sealing_chain, Costs.for_bytes(sealing_chain, bytes))
+		"Sealing this costs about %s. It is then prepared and checked in "
+		% Costs.format(sealing_chain, seal_cost)
+		+ "straight away — several transactions, one at a time, so give it a "
+		+ "minute — for about %s in all."
+		% Costs.format(sealing_chain, seal_cost + float(ready_cost["total"]))
 	)
 
 	if _seal_terms_line != null and _seal_interval != null:
@@ -1448,11 +1624,11 @@ func _seal_confirmed() -> void:
 		var fragments: Array[PackedByteArray] = []
 		if threshold <= 1:
 			# Any one of them opens it, so each simply gets the whole key.
-			# Splitting into one-of-n is not a threshold scheme.
+			# Splitting into one-of-n is not a threshold scheme. The marker on it
+			# is what tells the opening side not to hand this to Shamir, which
+			# would refuse it and leave the covenant shut for ever.
 			for i in witnesses:
-				var whole := PackedByteArray([0])
-				whole.append_array(key)
-				fragments.append(whole)
+				fragments.append(Covenant.whole_key(key))
 		else:
 			fragments = covenant.shatter(key, witnesses, threshold)
 		if fragments.is_empty():
@@ -1505,6 +1681,11 @@ func _seal_confirmed() -> void:
 	selected_id = tablet.id
 
 	_say("The tablet is inscribed: %s" % str(signature), TempleTheme.CYAN)
+
+	# One transaction at a time from here on. The inscription has only just
+	# been submitted, and the listing that follows is built against a chain
+	# state that has to include it.
+	await _pause(SETTLE_SECONDS)
 	await _publish_listings(tablet)
 	if not tablet.witness_envelopes.is_empty():
 		_say(
@@ -1513,7 +1694,46 @@ func _seal_confirmed() -> void:
 			+ "open them. Those witnesses need nothing but the signature.",
 			TempleTheme.CYAN
 		)
-	_say("Now build its altar, then tend the flame.", TempleTheme.YELLOW)
+	# A sealed covenant that was never prepared keeps nothing: its flame has no
+	# table to burn in, so it reads as UNLIT to every witness and its clock has
+	# not started. Nobody wants a half-made covenant, so the rest of the
+	# ceremony follows straight on from the seal rather than waiting on two
+	# more presses. The listings are already done above, so they are neither
+	# rewritten nor charged for twice.
+	_say("Making it ready to keep.", TempleTheme.YELLOW)
+	await _pause(SETTLE_SECONDS)
+	var lit := false
+	if await _prepare_tablet(tablet, false):
+		# The altar has just landed and this writes to it, which is the one
+		# place in the ceremony most likely to arrive too soon — so it is the
+		# one step allowed a second attempt.
+		await _pause(SETTLE_SECONDS)
+		lit = await _tend_tablet(tablet, 1)
+
+	if lit and ark.state_of(tablet) == Flame.State.BURNING:
+		_say(
+			"'%s' is sealed, prepared and burning. Check in again within %d days."
+			% [tablet.title, tablet.interval_days],
+			TempleTheme.CYAN
+		)
+	elif lit:
+		# Written and paid for, and the chain is merely behind. Saying it is
+		# unfinished here would send the keeper to pay for it a second time.
+		_say(
+			"'%s' is sealed, prepared and checked in. The chain has not shown "
+			% tablet.title
+			+ "the check-in back yet — press REFRESH in a minute to see it.",
+			TempleTheme.AMBER
+		)
+	else:
+		# The tablet is inscribed and permanent either way — only the records
+		# around it are missing, and PREPARE finishes exactly those.
+		_say(
+			"'%s' is inscribed, but its records are not finished. It is not "
+			% tablet.title
+			+ "keeping anything until they are: press PREPARE to try again.",
+			TempleTheme.BRIGHT_RED
+		)
 	_set_busy(false)
 	_rebuild_list()
 
@@ -1703,8 +1923,9 @@ func _show_open_panel() -> void:
 				(
 					"This route asks nothing of anyone. Your own machine grinds out a "
 					+ "sum that takes about %s, and the answer is the key. It cannot be "
-					+ "hurried, split across machines, or paused — closing the app loses "
-					+ "the progress and starts it over."
+					+ "hurried, split across machines, or paused. It runs in a window of "
+					+ "its own that you can push aside and leave to it — but Burning Bush "
+					+ "has to stay open, because closing it starts the climb over."
 				) % tablet.timelock_duration(),
 				TempleTheme.GREY,
 				TempleTheme.SIZE_SMALL
@@ -1762,12 +1983,26 @@ func _open_confirmed() -> void:
 		if not puzzle is Dictionary or (puzzle as Dictionary).is_empty():
 			_result("This tablet has no puzzle to solve.", TempleTheme.BRIGHT_RED)
 			return
-		_result("Solving. This will take about %s and cannot be hurried." % tablet.timelock_duration(), TempleTheme.YELLOW)
+		_result(
+			"Solving. This will take about %s and cannot be hurried."
+			% tablet.timelock_duration(),
+			TempleTheme.YELLOW
+		)
+		_say(
+			"Solving the puzzle of '%s'. Watch it in its own window."
+			% tablet.title,
+			TempleTheme.YELLOW
+		)
+		_solver = SolverWindow.open_beside(self, tablet.title, tablet.timelock_duration())
 		var secret := await iq.timelock_solve(puzzle, _on_solve_progress)
 		_solving_timelock = false
 		if secret.is_empty():
-			_result(iq.last_error, TempleTheme.BRIGHT_RED)
+			var refusal := _solve_refusal()
+			_end_solver(refusal)
+			_result(refusal, TempleTheme.BRIGHT_RED)
+			_say(refusal, TempleTheme.BRIGHT_RED)
 			return
+		_end_solver("")
 		key = Covenant.hex_to_bytes(secret)
 	else:
 		if not tablet.has(Tablet.Release.WITNESSES):
@@ -1945,12 +2180,43 @@ func _save_opened_file(tablet: Tablet, base64_data: String) -> void:
 
 ## Starts the long climb. Kept behind its own button so nobody begins days of
 ## computing by pressing the ordinary OPEN.
+##
+## It runs in a window of its own — one this app owns, beside the app rather
+## than inside a panel — so it can be pushed aside while the reader gets on
+## with something else, and so a display that changes once every quarter of an
+## hour is not sitting on top of everything else the app has to say.
+##
+## The app has to stay open for it. That is the one thing the window says
+## plainly, because a climb thrown away at 90% is a day nobody gets back.
 func _solve_confirmed() -> void:
+	var tablet := selected()
+	if tablet == null:
+		return
+	# Belt and braces, the same as OPEN: nothing releases a covenant whose
+	# keeper may simply be on holiday.
+	if not Flame.releasable(ark.state_of(tablet)):
+		_result("This covenant is not released yet.", TempleTheme.BRIGHT_RED)
+		return
+
+	# One climb at a time. The host solves one puzzle at a time and refuses a
+	# second outright, and that refusal would arrive in a window the reader is
+	# not looking at — so this doubles as the way back to a window that was
+	# closed while its climb kept going.
+	if _solver != null and is_instance_valid(_solver):
+		_solver.show()
+		_solver.call_deferred("move_to_center")
+		_result("Already solving. Its window is on screen.", TempleTheme.YELLOW)
+		return
+
 	_solving_timelock = true
 	await _open_confirmed()
 
 
 func _on_solve_progress(percent: float) -> void:
+	if _solver != null and is_instance_valid(_solver):
+		_solver.report(percent)
+	# Said in both places on purpose: the window can be closed, and the panel is
+	# behind it. Whichever one the reader is looking at, it is current.
 	_result(
 		"Solving... %d%%. This cannot be hurried, and closing the app loses the progress."
 		% int(percent),
@@ -1958,8 +2224,47 @@ func _on_solve_progress(percent: float) -> void:
 	)
 
 
+## Why the host would not start a climb, at more length than the host says it.
+##
+## One refusal deserves the explanation: a solve runs inside GodOnChain rather
+## than in this app, and it keeps running after the window that started it is
+## gone. So "a puzzle is already being solved" almost always means an earlier
+## climb of your own is still going, hours or days after the app that began it
+## was closed. It cannot be joined either — the host hands a finished puzzle to
+## the first caller that asks for it, and this app no longer knows which job to
+## ask about.
+func _solve_refusal() -> String:
+	if iq.last_code != 409:
+		return iq.last_error
+	return (
+		"GodOnChain is already solving a puzzle, and it does one at a time. That "
+		+ "is most likely a climb of your own from earlier: it runs inside "
+		+ "GodOnChain, not in this app, so it carries on for hours after the "
+		+ "window that started it is closed. This app cannot join it. Either wait "
+		+ "for it to finish, or restart GodOnChain to abandon it — which frees the "
+		+ "slot and starts this one again from nothing."
+	)
+
+
+## Closes the watching window. An empty reason means the puzzle opened, and the
+## word is about to appear in the app — there is nothing left for a progress
+## window to say. A reason means it stopped, and that stays on screen until it
+## is dismissed, because an error that closes itself is one nobody read.
+func _end_solver(reason: String) -> void:
+	if _solver == null or not is_instance_valid(_solver):
+		_solver = null
+		return
+	if reason.is_empty():
+		_solver.solved()
+	else:
+		_solver.failed(reason)
+	_solver = null
+
+
 func _result(message: String, colour: Color) -> void:
-	if _open_result == null:
+	# The panel it lives on can be closed while a solve runs on for hours, which
+	# is exactly what the separate window is for — so the label may be gone.
+	if _open_result == null or not is_instance_valid(_open_result):
 		return
 	_open_result.add_theme_color_override("font_color", colour)
 	_open_result.text = message
@@ -1971,7 +2276,14 @@ func _result(message: String, colour: Color) -> void:
 
 ## Chains the app can write to. The value is what the SDK expects; the label is
 ## what a person recognises.
-const CHAINS := [["SOL — Solana", "sol"], ["MON — Monad", "mon"]]
+## The chains a covenant may live on, as label and the code the host wants.
+## A tablet records its own, and one on-chain cannot be moved, so this list
+## only ever grows.
+const CHAINS := [
+	["SOL — Solana", "sol"],
+	["MON — Monad", "mon"],
+	["RH — Robinhood Chain", "rh"],
+]
 
 ## Width of the label column, so every control lines up down the panel.
 const LABEL_COLUMN := 200
@@ -2428,7 +2740,7 @@ func _on_write_progress(percent: float) -> void:
 const ACTIONS := {
 	"setup": ["SET UP", "Say where your records live and how often you will check in."],
 	"seal": ["NEW COVENANT", "Seal something to be released when you stop checking in."],
-	"prepare": ["PREPARE", "Create this covenant's records on-chain. Needed once, before checking in."],
+	"prepare": ["PREPARE", "Finish making this covenant: its records on-chain and its first check-in. Sealing does this already — this is the retry."],
 	"checkin": ["CHECK IN", "Prove you are still here. Do this before the deadline."],
 	"open": ["OPEN", "Read what was sealed, if enough shares are available."],
 	"publish": ["PUBLISH MY SHARE", "Releases it to everyone, permanently. To read it yourself instead, use OPEN."],
@@ -2508,7 +2820,11 @@ func _guidance_for(tablet: Tablet) -> Dictionary:
 	match state:
 		Flame.State.NEVER_LIT:
 			return {
-				"text": "'%s' has no records on-chain yet. Prepare it, then check in." % tablet.title,
+				"text": (
+					"'%s' was never finished: it has no records on-chain, so it "
+					% tablet.title
+					+ "is keeping nothing and its clock has not started. Prepare it."
+				),
 				"primary": "prepare" if mine else "",
 				"actions": build + tend + common,
 			}
@@ -3034,12 +3350,15 @@ func _show_help() -> void:
 		+ "trick: nobody has to decide whether you are gone, and no company or "
 		+ "friend has to still exist for it to work."],
 
-		["THE FOUR STEPS",
-		"SET UP names where your records live. NEW COVENANT seals the thing "
-		+ "and inscribes it. PREPARE creates that covenant's records on-chain "
-		+ "and is needed once before anything else works. CHECK IN then writes "
-		+ "a small record proving you are still here — that is the one you "
-		+ "repeat, before every deadline."],
+		["THE STEPS",
+		"SET UP names where your records live. NEW COVENANT does the rest in "
+		+ "one go: it seals the thing, inscribes it, creates its records "
+		+ "on-chain and checks in once, so it comes back already keeping. That "
+		+ "is several transactions and they are sent one at a time, on purpose, "
+		+ "so give it a minute. "
+		+ "CHECK IN then writes a small record proving you are still here — "
+		+ "that is the one you repeat, before every deadline. PREPARE is only "
+		+ "there for when something in that first ceremony did not finish."],
 
 		["THE CLOCK",
 		"Each covenant has its own chain, its own check-in interval and its "
@@ -3054,7 +3373,9 @@ func _show_help() -> void:
 		+ "opens to the whole world the moment you stop checking in. Chosen "
 		+ "witnesses: the key is split into shares and each is encrypted to "
 		+ "one witness's wallet. A puzzle: a sum that takes a set amount of "
-		+ "unbroken computing, which anyone may grind out. The last two can be "
+		+ "unbroken computing, which anyone may grind out. That one runs in a "
+		+ "window of its own you can push aside, though the app has to stay "
+		+ "open for it. The last two can be "
 		+ "combined; the first cannot be combined with anything, because a key "
 		+ "published in the open guards nothing."],
 

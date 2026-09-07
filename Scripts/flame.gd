@@ -188,8 +188,8 @@ func read_status(
 		# We reached the host and it had nothing for us, which in practice means
 		# the table has not been created — the flame was never lit. UNKNOWN is
 		# reserved for not being able to ask at all, which _ready() has already
-		# caught above. Matching on error text was chain-specific and left MON
-		# covenants reading as UNKNOWN forever.
+		# caught above. Matching on error text was chain-specific and left the
+		# EVM covenants reading as UNKNOWN forever.
 		var never := unknown.duplicate()
 		never["state"] = State.NEVER_LIT
 		return never

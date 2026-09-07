@@ -63,6 +63,15 @@ func prepare(progress: Callable = Callable()) -> Variant:
 	return result
 
 
+## Whether the registry table is already on-chain.
+##
+## Only the first covenant on a chain ever needs to create it; asking for one
+## that exists is a transaction that fails, and the keeper pays for the attempt.
+## Reads are free, so it is always cheaper to look first.
+func stands() -> bool:
+	return await space.on(chain).table_exists(TABLE_NAME)
+
+
 ## Lists one covenant so it can be found later.
 func publish(
 	tablet: Tablet, handle: String = "", progress: Callable = Callable()

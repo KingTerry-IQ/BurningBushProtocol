@@ -57,6 +57,7 @@ func _run() -> void:
 	_test_app_root()
 	_test_space_chains()
 	_test_id_collisions()
+	_test_solver_display()
 
 	print("\n%d failure(s)" % failures)
 	quit(1 if failures > 0 else 0)
@@ -229,6 +230,34 @@ func _test_covenant() -> void:
 
 	var one: Array[PackedByteArray] = [fragments[0], fragments[0]]
 	check("one witness cannot", covenant.gather(one).is_empty())
+
+	# One-of-one. A covenant sealed to a single witness gives that witness the
+	# key itself rather than a share, because any-one-of-n is not a threshold
+	# scheme — and Shamir rejects such a fragment twice over, so the path has to
+	# be recognised rather than interpolated. It was not, and the one witness of
+	# a dark covenant could not open the thing they were named to open.
+	var whole := Covenant.whole_key(key)
+	check("the whole key is one byte longer than the key", whole.size() == key.size() + 1)
+	check("  and is marked as itself, not as a share", Covenant.is_whole_key(whole))
+	check("  where a real share is not", not Covenant.is_whole_key(fragments[0]))
+	var alone: Array[PackedByteArray] = [whole]
+	check("one witness holding the whole key restores it", covenant.gather(alone) == key)
+	check("  and the tablet opens", covenant.unseal(tablet, covenant.gather(alone)) == word)
+
+	# It has to survive the journey: wrapped to a witness, published as
+	# testimony or pasted in by hand, a fragment travels as hex both ways.
+	var carried := covenant.read_fragment(Shamir.to_hex(whole))
+	check("the whole key survives the trip as hex", carried == whole)
+	var carried_alone: Array[PackedByteArray] = [carried]
+	check("  and still opens the tablet", covenant.unseal(tablet, covenant.gather(carried_alone)) == word)
+
+	# Shamir must never issue index 0 itself, or a real share could be mistaken
+	# for a whole key.
+	var zero_indexed := false
+	for fragment: PackedByteArray in fragments:
+		if fragment[0] == Covenant.WHOLE_KEY_MARKER:
+			zero_indexed = true
+	check("no real share ever carries the whole-key marker", not zero_indexed)
 
 
 func _test_flame_states() -> void:
@@ -865,6 +894,17 @@ func _test_app_root() -> void:
 
 	check("monad is recognised by either name",
 		IQSpace.is_monad("mon") and IQSpace.is_monad("MONAD") and not IQSpace.is_monad("sol"))
+	check("robinhood is recognised by either name",
+		IQSpace.is_robinhood("rh") and IQSpace.is_robinhood("ROBINHOOD")
+		and not IQSpace.is_robinhood("mon"))
+	# Everything that used to branch on Monad now branches on this. A chain
+	# that answers false here would be addressed as though it were Solana, and
+	# would look for a table address that no EVM chain has.
+	check("  and both address tables by name",
+		IQSpace.is_evm("rh") and IQSpace.is_evm("mon") and not IQSpace.is_evm("sol"))
+	check("  which the client agrees about",
+		IQClient.is_evm("robinhood") and IQClient.is_evm("mon")
+		and not IQClient.is_evm("sol"))
 
 	# A shared root is a shared namespace, so names must be separable by owner.
 	var a := IQSpace.scoped("Fid4pgTYLEVyQjMjBYQeB8HJ7FTdC5myYHQLz4CziSGb", "notes")
@@ -1058,3 +1098,48 @@ func _test_space_chains() -> void:
 		space.on("mon").on("sol").root == Tablet.APP_ROOT)
 	check("  and lands on the chain asked for",
 		space.on("mon").on("sol").chain == "sol")
+
+
+## What the solver window shows while a puzzle is being ground out. A reader
+## watching a bar for four days deserves one that is not lying to them.
+func _test_solver_display() -> void:
+	print("\n--- watching a puzzle ---")
+	var cells: int = PuzzleDisplay.BAR_CELLS
+
+	var empty := PuzzleDisplay.progress_bar(0.0)
+	check("an empty bar is all empty", empty.count(PuzzleDisplay.BAR_FULL) == 0)
+	check("  and is the width it says it is", empty.count(PuzzleDisplay.BAR_EMPTY) == cells)
+
+	var full := PuzzleDisplay.progress_bar(100.0)
+	check("a finished bar is all full", full.count(PuzzleDisplay.BAR_FULL) == cells)
+
+	# The one lie a progress bar can tell is a full bar on something still
+	# working, which is what rounding rather than truncating produces.
+	check(
+		"99% is not drawn as finished",
+		PuzzleDisplay.progress_bar(99.0).count(PuzzleDisplay.BAR_FULL) < cells
+	)
+	check(
+		"halfway is halfway",
+		PuzzleDisplay.progress_bar(50.0).count(PuzzleDisplay.BAR_FULL) == cells / 2
+	)
+	# Nothing the host sends should be able to draw outside the bar.
+	check("nonsense above 100 is clamped", PuzzleDisplay.progress_bar(400.0).length() == full.length())
+	check("nonsense below 0 is clamped", PuzzleDisplay.progress_bar(-5.0).length() == full.length())
+
+	# The clock is the proof that a solve is still alive, so it counts in
+	# seconds rather than rounding to "3h" like the rest of the app.
+	check("the clock starts at zero", PuzzleDisplay.clock(0) == "00:00:00")
+	check("  counts seconds", PuzzleDisplay.clock(9) == "00:00:09")
+	check("  and minutes", PuzzleDisplay.clock(605) == "00:10:05")
+	check("  and hours", PuzzleDisplay.clock(3661) == "01:01:01")
+	check("  and says days out loud past one", PuzzleDisplay.clock(90061) == "1d 01:01:01")
+	check("  and never runs backwards", PuzzleDisplay.clock(-30) == "00:00:00")
+
+	# The estimate is extrapolated from a whole-percent reading, so it is rounded
+	# on purpose: "about 04:29:56" claims a precision it cannot have.
+	check("an estimate in days says days and hours", PuzzleDisplay.remaining_phrase(183_600) == "about 2d 3h")
+	check("  in hours, hours and minutes", PuzzleDisplay.remaining_phrase(16_200) == "about 4h 30m")
+	check("  in minutes, only minutes", PuzzleDisplay.remaining_phrase(750) == "about 12m")
+	check("  and under a minute says so", PuzzleDisplay.remaining_phrase(41) == "under a minute")
+	check("  as does nothing at all", PuzzleDisplay.remaining_phrase(-5) == "under a minute")

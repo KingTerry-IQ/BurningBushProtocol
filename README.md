@@ -39,7 +39,9 @@ to be the other.
 ## How it works
 
 **The flame** is a row written to an on-chain table on a schedule you choose.
-Tending it costs roughly a dollar and takes one approval. Three states:
+Tending it costs well under a dollar and takes one approval — the exact figure
+depends on the chain the covenant lives on, and the app quotes it before you
+seal anything. Three states:
 
 | State | Meaning |
 |---|---|
@@ -57,7 +59,9 @@ secret because it's hidden — it's secret because the key is split.
 
 **The fragments** come from Shamir's scheme over GF(256). Any *k* of *n*
 restore the key; fewer reveal *nothing*, and that's information-theoretic, not
-a matter of computing power.
+a matter of computing power. A threshold of one is not a split at all — each
+witness simply gets the key itself, and the panel says as much before you seal
+it.
 
 **Fragments travel on-chain.** Give a witness their identity key and their
 fragment is encrypted to it and inscribed alongside the tablet — nothing to
@@ -76,6 +80,12 @@ the app says so before you do it.
 **Release modes combine.** A tablet may use witnesses, a public burn, or both,
 in which case whichever happens first opens it.
 
+**A puzzle is solved in a window of its own.** SOLVE THE PUZZLE opens one beside
+the app, showing how far along the climb is and how long is left at the rate
+this machine has actually managed. Push it aside or close it — the climb carries
+on and the word appears in the app. Closing *Burning Bush* is what loses it, and
+the window says so while it runs.
+
 ## Requirements
 
 Burning Bush Protocol **holds no keys**. It's a client of
@@ -89,12 +99,25 @@ capability, not a requirement.
 
 1. Open `project.godot` in Godot 4.7+ and press **F5**.
 2. **SETTINGS** — name a covenant root (the `dbRootId` your flame lives under),
-   pick a chain, and set the interval and grace period.
+   pick a chain, and set the interval and grace period. Solana, Monad and
+   Robinhood Chain are all offered; a covenant records its own and, being
+   on-chain, cannot be moved afterwards, so choose it with the yearly
+   check-in cost in mind. The panel shows that cost as you change the terms.
 3. **NEW COVENANT** — write the word or choose a file, name your witnesses,
-   and say how many fragments are needed to open it.
-4. **BUILD ALTAR** — creates that tablet's flame table, and the place its
-   witnesses will testify. Once per tablet.
-5. **TEND** — writes a proof-of-life row. Do this on schedule.
+   and say how many fragments are needed to open it. Sealing runs the whole
+   ceremony in one go: it inscribes the tablet, builds its altar — the flame
+   table, and the place its witnesses will testify — and writes the first
+   proof-of-life row, so the covenant comes back already keeping. Those are
+   several transactions and they are sent one at a time — a chain will not
+   take them all at once — so give it a minute. The panel quotes the whole
+   cost before you seal anything.
+4. **CHECK IN** — writes a proof-of-life row. Do this on schedule. It is the
+   only step you repeat.
+
+**PREPARE** is there for when something in that first ceremony did not finish —
+an altar half-built, a listing that failed. It is safe to run twice: it looks
+before it builds, so it pays only for the parts that are actually missing, and
+it carries on into the check-in the same way sealing does.
 
 As a witness: **MY IDENTITY** gives you the key to hand a keeper. **ADOPT**
 takes a tablet by its signature. **TESTIFY** opens the fragment addressed to
@@ -117,8 +140,10 @@ Scripts/
   scripture.gd     Everything the app says out loud
   temple_theme.gd  Sixteen colours on black
 Scenes/
-  main.gd          The app
-  bush.gd          The bush, drawn in text and set on fire
+  main.gd            The app
+  bush.gd            The bush, drawn in text and set on fire
+  solver_window.gd   The window a puzzle is ground out in
+  puzzle_display.gd  What a climb looks like while it runs
 addons/iq_client/  Drop-in client for the GodOnChain host
 tools/
   bbp_selftest.gd  Headless checks
@@ -146,7 +171,8 @@ on the happy path would silently produce a covenant nobody can ever open — and
 there is no finding that out later. The suite checks every one of the 255
 non-zero field elements, all ten 3-of-5 subsets rather than the convenient one,
 that fragment order doesn't matter, that below-threshold reconstruction returns
-a *wrong* answer without leaking the plaintext, and the full seal → shatter →
+a *wrong* answer without leaking the plaintext, the one-of-one case where the
+witness holds the key rather than a share of it, and the full seal → shatter →
 gather → unseal path.
 
 ## Read this before you seal anything

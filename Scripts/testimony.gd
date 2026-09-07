@@ -58,6 +58,17 @@ func prepare(progress: Callable = Callable()) -> Variant:
 	return result
 
 
+## Whether the place of testimony is already on-chain.
+##
+## Asked before building one: creating a table that exists is a transaction
+## that fails, and preparing a covenant twice — which is exactly what PREPARE
+## is for — should not pay for the parts that already worked.
+func stands() -> bool:
+	if not _ready():
+		return false
+	return await _space().table_exists(table_name())
+
+
 ## Publishes one fragment. This is a release, not a read: once enough are here,
 ## the covenant is open to everyone forever.
 func testify(

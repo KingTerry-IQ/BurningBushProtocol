@@ -118,8 +118,42 @@ func shatter(
 	return fragments
 
 
+## A one-of-n covenant hands every witness the key itself rather than a share,
+## because splitting a secret so that any single piece restores it is not a
+## threshold scheme — it is the key, copied. The marker says which of the two a
+## fragment is.
+##
+## Zero is the right marker precisely because Shamir can never issue it: x = 0
+## is where the secret sits on the polynomial, so shares are numbered from one.
+## A fragment beginning 0 is therefore unambiguous, and travels every path a
+## real share does — wrapped to a witness, published as testimony, pasted in by
+## hand — without any of them needing to know the difference.
+const WHOLE_KEY_MARKER := 0
+
+
+## The key, in a fragment's clothing.
+static func whole_key(key: PackedByteArray) -> PackedByteArray:
+	var out := PackedByteArray([WHOLE_KEY_MARKER])
+	out.append_array(key)
+	return out
+
+
+## Whether this fragment is a whole key rather than a share of one.
+static func is_whole_key(fragment: PackedByteArray) -> bool:
+	return fragment.size() == KEY_BYTES + 1 and fragment[0] == WHOLE_KEY_MARKER
+
+
 ## Rebuilds the key from fragments handed back by witnesses.
 func gather(fragments: Array[PackedByteArray]) -> PackedByteArray:
+	# One of these may not be a share at all. A one-of-n covenant gives each
+	# witness the whole key, and Shamir refuses such a fragment twice over — it
+	# wants two of them, and it rejects the zero index — so a covenant sealed
+	# to a single witness could never be opened by that witness, which is the
+	# one thing it existed to allow.
+	for fragment: PackedByteArray in fragments:
+		if is_whole_key(fragment):
+			return fragment.slice(1)
+
 	var problem: Array = []
 	var key := Shamir.combine(fragments, problem)
 	if key.is_empty():
