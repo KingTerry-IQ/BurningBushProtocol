@@ -1901,20 +1901,11 @@ func _show_open_panel() -> void:
 					"A share is one piece of the key. This tablet holds none "
 					+ "addressed to your wallet, so opening it means collecting "
 					+ "shares from the witnesses it does name. Any they have "
-					+ "already testified on-chain are counted for you; paste "
-					+ "below only ones handed to you privately.",
+					+ "already testified on-chain are counted for you.",
 					TempleTheme.GREY,
 					TempleTheme.SIZE_SMALL
 				)
 			)
-
-		# Only for someone who is not a named witness: a witness's own share
-		# arrives inside the tablet, and shares are never passed by hand.
-		if not addressed_to_me:
-			_open_fragments = TextEdit.new()
-			_open_fragments.custom_minimum_size = Vector2(0, 160)
-			_open_fragments.placeholder_text = "One share per line..."
-			box.add_child(_open_fragments)
 
 	if tablet.has(Tablet.Release.TIME_LOCK):
 		box.add_child(TempleTheme.line("THE PUZZLE", TempleTheme.YELLOW, TempleTheme.SIZE_SMALL))
